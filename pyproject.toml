@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiger-factors"
+version = "0.1.0"
+description = "Factor construction and parquet persistence for Tiger Quant"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["tiger_factors*"]
