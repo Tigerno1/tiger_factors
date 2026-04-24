@@ -113,7 +113,7 @@ This example:
 
 ```python
 from pathlib import Path
-from tiger_factors.multifactor_evaluation import build_factor_registry
+from tiger_factors.factor_screener import build_factor_registry
 
 registry = build_factor_registry(
     {

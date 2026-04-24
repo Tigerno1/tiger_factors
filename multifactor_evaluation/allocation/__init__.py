@@ -50,6 +50,12 @@ def _resolve_period(config: LongShortReturnConfig) -> int | str | pd.Timedelta:
     return config.periods[0]
 
 
+def resolve_return_period(preferred_period: int | str | pd.Timedelta | None) -> int | str | pd.Timedelta:
+    if preferred_period is not None:
+        return preferred_period
+    return 1
+
+
 def _import_riskfolio() -> Any:
     try:
         import riskfolio as rp
@@ -223,4 +229,5 @@ __all__ = [
     "build_long_short_return_panel",
     "compute_factor_long_short_returns",
     "optimize_factor_weights_with_riskfolio",
+    "resolve_return_period",
 ]

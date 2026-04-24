@@ -33,9 +33,9 @@ MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
 
 from tiger_factors.factor_screener import FactorMetricFilterConfig
 from tiger_factors.factor_screener import build_factor_registry_from_root
+from tiger_factors.factor_screener import cluster_factors
+from tiger_factors.factor_screener import factor_correlation_matrix
 from tiger_factors.factor_screener import screen_factor_registry
-from tiger_factors.multifactor_evaluation.redundancy import cluster_factors
-from tiger_factors.multifactor_evaluation.redundancy import factor_correlation_matrix
 
 
 DEFAULT_SUMMARY_REGISTRY = Path("/Volumes/Quant_Disk/evaluation/summary/summary_registry.parquet")

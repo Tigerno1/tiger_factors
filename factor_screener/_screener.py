@@ -7,19 +7,21 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
-from tiger_factors.factor_store import TigerFactorLibrary
 from tiger_factors.factor_evaluation.utils import period_to_label
-from tiger_factors.factor_evaluation.performance import factor_returns
 from tiger_factors.factor_evaluation.performance import mean_return_by_quantile
-from tiger_factors.factor_evaluation.utils import get_clean_factor_and_forward_returns as tiger_clean_factor_and_forward_returns
-from tiger_factors.factor_store import FactorStore
+from tiger_factors.factor_evaluation.utils import (
+    get_clean_factor_and_forward_returns as tiger_clean_factor_and_forward_returns,
+)
 from tiger_factors.factor_store import FactorSpec
+from tiger_factors.factor_store import FactorStore
+from tiger_factors.factor_store import TigerFactorLibrary
 from tiger_factors.multifactor_evaluation.allocation import LongShortReturnConfig
 from tiger_factors.multifactor_evaluation.allocation import compute_factor_long_short_returns
+from tiger_factors.multifactor_evaluation.allocation import resolve_return_period
+from tiger_factors.factor_screener.screening import FactorMetricFilterConfig
+from tiger_factors.factor_screener.screening import screen_factor_metrics
 from tiger_factors.multifactor_evaluation._inputs import coerce_factor_series
-from tiger_factors.multifactor_evaluation.screening import FactorMetricFilterConfig
-from tiger_factors.multifactor_evaluation.screening import screen_factor_metrics
-from tiger_factors.multifactor_evaluation.selection import select_non_redundant_factors
+from tiger_factors.factor_screener.selection import select_non_redundant_factors
 
 
 def _coerce_factor_names(factor_names: Iterable[str]) -> tuple[str, ...]:
@@ -37,12 +39,6 @@ def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Serie
     cleaned = cleaned[~cleaned.index.isna()].sort_index()
     cleaned.name = factor_name
     return cleaned
-
-
-def _resolve_period(config: "TigerScreenerSpec") -> int | str | pd.Timedelta:
-    if config.preferred_return_period is not None:
-        return config.preferred_return_period
-    return 1
 
 
 def _pick_return_column(frame: pd.DataFrame, *, preferred_period: str | int | pd.Timedelta | None = None) -> str:
@@ -66,18 +62,11 @@ def _pick_return_column(frame: pd.DataFrame, *, preferred_period: str | int | pd
     if len(frame.columns) == 1:
         return frame.columns[0]
 
-    numeric_columns = [
-        column
-        for column in frame.columns
-        if pd.api.types.is_numeric_dtype(frame[column])
-    ]
+    numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
     if numeric_columns:
         return numeric_columns[0]
 
-    raise KeyError(
-        "Could not infer a return column. "
-        f"Available columns: {columns!r}"
-    )
+    raise KeyError(f"Could not infer a return column. Available columns: {columns!r}")
 
 
 def _top_quantile_series_from_mean_returns(
@@ -151,7 +140,7 @@ def _series_to_long_frame(
 
 
 @dataclass(frozen=True)
-class TigerScreenerSpec:
+class FactorScreenerSpec:
     factor_names: tuple[str, ...]
     provider: str = "tiger"
     region: str = "us"
@@ -184,8 +173,8 @@ class TigerScreenerSpec:
 
 
 @dataclass(frozen=True)
-class TigerScreenerResult:
-    spec: TigerScreenerSpec
+class FactorScreenerResult:
+    spec: FactorScreenerSpec
     screened_at: pd.Timestamp
     summary: pd.DataFrame
     selection_summary: pd.DataFrame
@@ -249,10 +238,10 @@ class TigerScreenerResult:
         }
 
 
-class TigerScreener:
+class FactorScreener:
     def __init__(
         self,
-        spec: TigerScreenerSpec,
+        spec: FactorScreenerSpec,
         *,
         store: FactorStore | None = None,
     ) -> None:
@@ -312,7 +301,7 @@ class TigerScreener:
         factor_spec = self.spec.factor_spec(factor_name)
         section = self.store.evaluation.section(factor_spec, self.spec.returns_section)
         candidates = ("mean_return_by_quantile_by_date", "mean_return_by_quantile")
-        period_label = period_to_label(_resolve_period(self.spec))
+        period_label = period_to_label(resolve_return_period(self.spec.preferred_return_period))
         for table_name in candidates:
             try:
                 frame = section.get_table(table_name)
@@ -350,7 +339,7 @@ class TigerScreener:
         )
         return_modes: dict[str, pd.Series] = {}
         if isinstance(factor_panel, pd.DataFrame) and not factor_panel.empty and self.spec.price_panel is not None:
-            selected_period = _resolve_period(self.spec)
+            selected_period = resolve_return_period(self.spec.preferred_return_period)
             try:
                 prepared = _build_factor_data(
                     factor_panel,
@@ -358,29 +347,16 @@ class TigerScreener:
                     selected_period=selected_period,
                 )
                 if "long_short" in self.spec.return_modes:
-                    long_short = factor_returns(
-                        prepared.factor_data,
-                        demeaned=True,
-                        group_adjust=False,
-                        equal_weight=False,
+                    series = compute_factor_long_short_returns(
+                        factor_panel,
+                        self.spec.price_panel,
+                        config=LongShortReturnConfig(
+                            periods=(selected_period,),
+                            selected_period=selected_period,
+                        ),
                     )
-                    period_label = period_to_label(selected_period)
-                    if period_label in long_short.columns:
-                        return_modes["long_short"] = _normalize_return_series(
-                            long_short[period_label],
-                            factor_name=factor_name,
-                        )
-                    else:
-                        series = compute_factor_long_short_returns(
-                            factor_panel,
-                            self.spec.price_panel,
-                            config=LongShortReturnConfig(
-                                periods=(selected_period,),
-                                selected_period=selected_period,
-                            ),
-                        )
-                        if isinstance(series, pd.Series) and not series.empty:
-                            return_modes["long_short"] = _normalize_return_series(series, factor_name=factor_name)
+                    if isinstance(series, pd.Series) and not series.empty:
+                        return_modes["long_short"] = _normalize_return_series(series, factor_name=factor_name)
                 if "long_only" in self.spec.return_modes:
                     long_only = _top_quantile_series_from_mean_returns(
                         prepared.factor_data,
@@ -417,7 +393,7 @@ class TigerScreener:
                 key = f"{factor_name}:{mode}"
                 return_series[key] = series
                 return_long_frames.append(_series_to_long_frame(series, factor_name=factor_name, return_mode=mode))
-            if factor_name not in {key.split(":")[0] for key in return_series}:
+            if factor_name not in {key.split(":", 1)[0] for key in return_series}:
                 missing_return_factors.append(factor_name)
 
         return_long = (
@@ -435,7 +411,7 @@ class TigerScreener:
 
         return return_series, return_long, missing_return_factors
 
-    def run(self) -> TigerScreenerResult:
+    def run(self) -> FactorScreenerResult:
         factor_names = self.spec.normalized_factor_names()
         summary_frames: list[pd.DataFrame] = []
         for factor_name in factor_names:
@@ -499,7 +475,11 @@ class TigerScreener:
 
         return_series, return_long, missing_return_factors = self._build_return_long_table(selected_names)
 
-        primary_mode = "long_short" if "long_short" in self.spec.return_modes else (self.spec.return_modes[0] if self.spec.return_modes else "long_short")
+        primary_mode = (
+            "long_short"
+            if "long_short" in self.spec.return_modes
+            else (self.spec.return_modes[0] if self.spec.return_modes else "long_short")
+        )
         primary_series: dict[str, pd.Series] = {
             key.split(":", 1)[0]: series
             for key, series in return_series.items()
@@ -511,14 +491,16 @@ class TigerScreener:
             return_panel = return_panel.loc[~return_panel.index.isna()].sort_index()
 
         if not return_long.empty and "factor" in return_long.columns:
-            range_table = return_long.groupby("factor")["date_"].agg(["min", "max"]).rename(columns={"min": "return_start", "max": "return_end"})
+            range_table = return_long.groupby("factor")["date_"].agg(["min", "max"]).rename(
+                columns={"min": "return_start", "max": "return_end"}
+            )
             if not screened_summary.empty and "factor_name" in screened_summary.columns:
                 screened_summary = screened_summary.merge(range_table, how="left", left_on="factor_name", right_index=True)
             if not selection_summary.empty and "factor_name" in selection_summary.columns:
                 selection_summary = selection_summary.merge(range_table, how="left", left_on="factor_name", right_index=True)
                 selection_summary["screened_at"] = screened_at.isoformat()
 
-        return TigerScreenerResult(
+        return FactorScreenerResult(
             spec=self.spec,
             screened_at=screened_at,
             summary=screened_summary.reset_index(drop=True) if not screened_summary.empty else screened_summary,
@@ -530,7 +512,7 @@ class TigerScreener:
         )
 
 
-def run_tiger_screener(
+def run_factor_screener(
     factor_names: Iterable[str],
     *,
     store: FactorStore | None = None,
@@ -548,8 +530,8 @@ def run_tiger_screener(
     return_modes: tuple[str, ...] = ("long_short", "long_only"),
     selection_threshold: float | None = 0.75,
     selection_score_field: str = "fitness",
-) -> TigerScreenerResult:
-    spec = TigerScreenerSpec(
+) -> FactorScreenerResult:
+    spec = FactorScreenerSpec(
         factor_names=_coerce_factor_names(factor_names),
         provider=provider,
         region=region,
@@ -566,21 +548,12 @@ def run_tiger_screener(
         selection_score_field=selection_score_field,
         screening_config=screening_config or FactorMetricFilterConfig(),
     )
-    return TigerScreener(spec, store=store).run()
+    return FactorScreener(spec, store=store).run()
 
 
 __all__ = [
-    "TigerScreener",
-    "TigerScreenerResult",
-    "TigerScreenerSpec",
     "FactorScreener",
     "FactorScreenerResult",
     "FactorScreenerSpec",
-    "run_tiger_screener",
     "run_factor_screener",
 ]
-
-FactorScreener = TigerScreener
-FactorScreenerResult = TigerScreenerResult
-FactorScreenerSpec = TigerScreenerSpec
-run_factor_screener = run_tiger_screener
