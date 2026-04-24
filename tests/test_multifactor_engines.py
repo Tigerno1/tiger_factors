@@ -10,8 +10,6 @@ from tiger_factors.factor_screener import factor_correlation_matrix
 from tiger_factors.factor_screener import ic_correlation_matrix
 from tiger_factors.factor_screener import select_by_average_correlation
 from tiger_factors.factor_screener import select_by_graph_independent_set
-from tiger_factors.factor_screener import run_correlation_screening
-from tiger_factors.factor_screener import run_ic_correlation_screening
 from tiger_factors.factor_evaluation.factor_screening import build_single_factor_return_long_frame
 from tiger_factors.multifactor_evaluation.batch import FactorScreeningEngine
 from tiger_factors.factor_allocation import allocate_from_return_panel
@@ -168,34 +166,12 @@ def test_redundancy_tools_build_correlation_and_clusters() -> None:
     clusters = cluster_factors(factor_corr, threshold=0.5)
     average_selected = select_by_average_correlation(factors, {"trend": 3.0, "reverse": 2.0, "orthogonal": 1.0}, threshold=0.5)
     graph_selected = select_by_graph_independent_set(factors, {"trend": 3.0, "reverse": 2.0, "orthogonal": 1.0}, threshold=0.5)
-    average_via_wrapper = run_correlation_screening(
-        factors,
-        {"trend": 3.0, "reverse": 2.0, "orthogonal": 1.0},
-        method="average",
-        threshold=0.5,
-    )
-    graph_via_wrapper = run_correlation_screening(
-        factors,
-        {"trend": 3.0, "reverse": 2.0, "orthogonal": 1.0},
-        method="graph",
-        threshold=0.5,
-    )
-    ic_average_via_wrapper = run_ic_correlation_screening(
-        factors,
-        prices,
-        method="average",
-        threshold=0.5,
-        scores={"trend": 3.0, "reverse": 2.0, "orthogonal": 1.0},
-    )
 
     assert factor_corr.shape == (3, 3)
     assert ic_corr.shape == (3, 3)
     assert set(clusters) == {"trend", "reverse", "orthogonal"}
     assert set(average_selected).issubset(set(factors))
     assert set(graph_selected).issubset(set(factors))
-    assert average_via_wrapper == average_selected
-    assert graph_via_wrapper == graph_selected
-    assert set(ic_average_via_wrapper).issubset(set(factors))
 
 
 def test_return_only_allocation_and_backtest() -> None:

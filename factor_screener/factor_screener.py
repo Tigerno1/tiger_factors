@@ -12,7 +12,6 @@ from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
 from tiger_factors.factor_screener.screening import FactorMetricFilterConfig
 from tiger_factors.factor_screener.screening import screen_factor_metrics
-from tiger_factors.factor_screener.selection import select_non_redundant_factors
 
 
 def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Series:
@@ -194,10 +193,6 @@ def _factor_panel_is_sufficient(
 
 @dataclass(frozen=True)
 class FactorScreenerSpec:
-    selection_threshold: float | None = 0.75
-    selection_score_field: str = "fitness"
-    correlation_method: str = "greedy"
-    ic_correlation_method: str = "greedy"
     min_factor_observations: int | None = 5
     min_factor_dates: int | None = 3
     min_factor_codes: int | None = 3
@@ -280,10 +275,6 @@ class FactorScreenerResult:
             "selected_count": int(len(self.selected_factor_names)),
             "rejected_factor_names": self.rejected_factor_names,
             "missing_return_factors": list(self.missing_return_factors),
-            "selection_threshold": self.spec.selection_threshold,
-            "selection_score_field": self.spec.selection_score_field,
-            "correlation_method": self.spec.correlation_method,
-            "ic_correlation_method": self.spec.ic_correlation_method,
             "return_start": return_start,
             "return_end": return_end,
             "summary_rows": int(len(self.summary)),
@@ -507,31 +498,13 @@ class FactorScreener:
             else []
         )
         factor_panels = {name: panel for name, panel in factor_panels.items() if name in screened_names}
-
-        if self.spec.selection_threshold is not None and len(factor_panels) > 1:
-            score_field = self.spec.selection_score_field
-            if score_field not in screened_summary.columns:
-                score_field = "fitness" if "fitness" in screened_summary.columns else screened_summary.columns[-1]
-            score_map = (
-                screened_summary.set_index("factor_name")[score_field].astype(float).abs().to_dict()
-                if "factor_name" in screened_summary.columns and score_field in screened_summary.columns
-                else {name: 1.0 for name in factor_panels}
-            )
-            selected_names = select_non_redundant_factors(
-                factor_panels,
-                score_map,
-                threshold=float(self.spec.selection_threshold),
-            )
-        else:
-            selected_names = list(factor_panels.keys()) if factor_panels else screened_names
+        selected_names = list(factor_panels.keys()) if factor_panels else screened_names
 
         if not selection_summary.empty and "factor_name" in selection_summary.columns:
             selection_summary = selection_summary.copy()
             selection_summary["selected"] = selection_summary["factor_name"].astype(str).isin(selected_names)
             if "selected_score" not in selection_summary.columns:
-                score_field = self.spec.selection_score_field
-                if score_field not in selection_summary.columns:
-                    score_field = "fitness" if "fitness" in selection_summary.columns else None
+                score_field = "fitness" if "fitness" in selection_summary.columns else None
                 if score_field is not None:
                     selection_summary["selected_score"] = selection_summary[score_field]
 

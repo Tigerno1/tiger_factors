@@ -11,9 +11,9 @@ from dataclasses import field
 import numpy as np
 import pandas as pd
 
-from tiger_factors.factor_screener._screener import FactorScreener
-from tiger_factors.factor_screener._screener import FactorScreenerResult
-from tiger_factors.factor_screener._screener import FactorScreenerSpec
+from tiger_factors.factor_screener.factor_screener import FactorScreener
+from tiger_factors.factor_screener.factor_screener import FactorScreenerResult
+from tiger_factors.factor_screener.factor_screener import FactorScreenerSpec
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_screener.selection import FactorMarginalSelectionConfig
 from tiger_factors.factor_screener.selection import select_factors_by_marginal_gain

@@ -1,8 +1,8 @@
-"""Run screener first, then feed the selected factors into multifactor evaluation.
+"""Run the total screener workflow, then feed the selected factors into multifactor evaluation.
 
-This demo shows the intended boundary between the two modules:
+This demo shows the intended boundary between the layers:
 
-1. ``factor_screener`` filters a candidate factor basket
+1. ``Screener`` dispatches the factor screener and the correlation screener
 2. ``multifactor_evaluation`` takes the selected factors and builds the
    composite backtest plus report
 
@@ -35,9 +35,9 @@ from tiger_factors.factor_store import DEFAULT_FACTOR_STORE_ROOT
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
 from tiger_factors.factor_screener import FactorMetricFilterConfig
-from tiger_factors.factor_screener import FactorMarginalSelectionConfig
-from tiger_factors.factor_screener import FactorScreener
+from tiger_factors.factor_screener import CorrelationScreenerSpec
 from tiger_factors.factor_screener import FactorScreenerSpec
+from tiger_factors.factor_screener import Screener
 from tiger_factors.factor_allocation import allocate_from_return_panel
 from tiger_factors.factor_backtest import run_return_backtest
 from tiger_factors.multifactor_evaluation.reporting.analysis_report import create_analysis_report
@@ -89,32 +89,10 @@ class SingleFactorScreeningConfig:
 
 @dataclass(frozen=True)
 class CorrelationScreeningConfig:
-    ic_horizon: int = 1
-    ic_min_names: int | None = 10
-    marginal_gain_score_fields: tuple[str, ...] = (
-        "directional_fitness",
-        "directional_ic_ir",
-        "directional_sharpe",
-    )
-    marginal_gain_score_weights: tuple[float, ...] = (0.50, 0.25, 0.25)
-    marginal_gain_penalty_fields: tuple[str, ...] = ("turnover", "max_drawdown")
-    marginal_gain_penalty_weights: tuple[float, ...] = (0.20, 0.10)
-    marginal_gain_corr_weight: float = 0.50
-    marginal_gain_min_improvement: float = 0.0
-    marginal_gain_min_base_score: float | None = None
-    marginal_gain_standardize: bool = True
-
-    def marginal_gain_config(self) -> FactorMarginalSelectionConfig:
-        return FactorMarginalSelectionConfig(
-            score_fields=self.marginal_gain_score_fields,
-            score_weights=self.marginal_gain_score_weights,
-            penalty_fields=self.marginal_gain_penalty_fields,
-            penalty_weights=self.marginal_gain_penalty_weights,
-            corr_weight=self.marginal_gain_corr_weight,
-            min_improvement=self.marginal_gain_min_improvement,
-            min_base_score=self.marginal_gain_min_base_score,
-            standardize=self.marginal_gain_standardize,
-        )
+    evaluation_source: str = "factor"
+    method: str = "greedy"
+    threshold: float = 0.75
+    score_field: str = "fitness"
 
 
 FACTOR_ROOT = str(DEFAULT_FACTOR_STORE_ROOT)
@@ -139,7 +117,26 @@ OPEN_BROWSER = False
 
 
 CONFIG_SINGLE_FACTOR = SingleFactorScreeningConfig()
-CONFIG_CORRELATION = CorrelationScreeningConfig()
+CONFIG_CORRELATION_STEPS = (
+    CorrelationScreeningConfig(
+        evaluation_source="factor",
+        method="greedy",
+        threshold=0.75,
+        score_field="fitness",
+    ),
+    CorrelationScreeningConfig(
+        evaluation_source="ic",
+        method="greedy",
+        threshold=0.60,
+        score_field="fitness",
+    ),
+    CorrelationScreeningConfig(
+        evaluation_source="return",
+        method="greedy",
+        threshold=0.00,
+        score_field="fitness",
+    ),
+)
 
 def main() -> None:
     output_dir = Path(OUTPUT_DIR)
@@ -159,27 +156,33 @@ def main() -> None:
         for factor_name in factor_names
     ]
 
-    # 1) Build spec inputs for the screener. The screener will resolve factor
+    # 1) Build spec inputs for the workflow. The workflow will resolve factor
     # evaluation artifacts from the store internally.
     screener_spec = FactorScreenerSpec(
         screening_config=CONFIG_SINGLE_FACTOR.metric_filter_config(),
-        selection_threshold=0.75,
-        selection_score_field="fitness",
-        correlation_method="marginal_gain",
-        ic_correlation_method="greedy",
     )
 
-    # 2) Run the screener. It loads factor evaluation artifacts internally and
-    # returns the selected specs plus the selected return panel.
-    screener_result = FactorScreener(
+    correlation_specs = tuple(
+        CorrelationScreenerSpec(
+            evaluation_source=config.evaluation_source,
+            method=config.method,
+            threshold=config.threshold,
+            score_field=config.score_field,
+        )
+        for config in CONFIG_CORRELATION_STEPS
+    )
+
+    # 2) Run the total screener. It first applies the factor screener, then
+    # dispatches the correlation screener on the surviving factor specs.
+    workflow_result = Screener(
         screener_spec,
+        correlation_specs,
         factor_specs=tuple(candidate_specs),
         store=store,
     ).run()
-    screener_result.save_detail(output_dir / "screener")
+    workflow_result.factor_result.save_detail(output_dir / "screener")
 
-    selected_factor_specs = screener_result.selected_factor_specs
-    return_panel = screener_result.return_panel
+    return_panel = workflow_result.return_panel
 
     # 3) Allocate directly from the return panel.
     factor_weights = allocate_from_return_panel(return_panel)
@@ -221,19 +224,20 @@ def main() -> None:
             "open_browser": OPEN_BROWSER,
         },
         "single_factor_screening_config": asdict(CONFIG_SINGLE_FACTOR),
-        "correlation_screening_config": asdict(CONFIG_CORRELATION),
-        "selection_threshold": screener_spec.selection_threshold,
-        "selection_score_field": screener_spec.selection_score_field,
-        "correlation_method": screener_spec.correlation_method,
-        "ic_correlation_method": screener_spec.ic_correlation_method,
+        "correlation_screening_configs": [asdict(config) for config in CONFIG_CORRELATION_STEPS],
         "factor_names": factor_names,
         "candidate_factor_specs": [asdict(spec) for spec in candidate_specs],
-        "selected_factor_names": [spec.table_name for spec in selected_factor_specs],
-        "selected_factor_specs": [asdict(spec) for spec in selected_factor_specs],
+        "selected_factor_names": [spec.table_name for spec in workflow_result.selected_factor_specs],
+        "selected_factor_specs": [asdict(spec) for spec in workflow_result.selected_factor_specs],
+        "factor_selected_factor_names": [spec.table_name for spec in workflow_result.factor_selected_factor_specs],
+        "factor_selected_factor_specs": [asdict(spec) for spec in workflow_result.factor_selected_factor_specs],
         "output_dir": str(output_dir),
         "return_panel_columns": list(return_panel.columns),
         "factor_weights": {name: float(weight) for name, weight in factor_weights.items()},
-        "raw_screener_summary": screener_result.to_summary(),
+        "workflow_summary": workflow_result.to_summary(),
+        "factor_screener_summary": workflow_result.factor_result.to_summary(),
+        "correlation_screener_summary": workflow_result.correlation_result.to_summary(),
+        "correlation_screener_chain": [result.to_summary() for result in workflow_result.correlation_results],
         "analysis_report_path": None if report.get_report(open_browser=False) is None else str(report.get_report(open_browser=False)),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -244,7 +248,9 @@ def main() -> None:
 
     print("screened factors:")
     print(f"  candidates: {factor_names}")
-    print(f"  selected specs: {[spec.table_name for spec in selected_factor_specs]}")
+    print(f"  factor-selected specs: {[spec.table_name for spec in workflow_result.factor_selected_factor_specs]}")
+    print(f"  selected specs: {[spec.table_name for spec in workflow_result.selected_factor_specs]}")
+    print(f"  correlation chain: {[result.spec.evaluation_source + ':' + result.spec.method for result in workflow_result.correlation_results]}")
     print(f"  return panel columns: {list(return_panel.columns)}")
     print("\nallocation weights:")
     print(pd.Series(factor_weights).to_string())
