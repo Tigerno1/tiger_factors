@@ -8,6 +8,20 @@ workspace. It is designed to:
 - compute single factors in a consistent long-table format
 - save each factor as its own parquet dataset plus metadata json
 
+For factor research and combination work, the preferred split is now:
+
+- `tiger_factors.factor_screener`
+  - single-factor screening
+  - correlation screening
+  - returns selected `FactorSpec` objects
+- `tiger_factors.factor_allocation`
+  - factor-level weight allocation from return panels
+- `tiger_factors.factor_backtest`
+  - return-based backtesting
+- `tiger_factors.multifactor_evaluation`
+  - analysis and reporting
+  - tear sheets, tables, figures, and factor/portfolio diagnostics
+
 ## Quick Start
 
 Activate the shared Python 3.12 environment first:
@@ -60,7 +74,7 @@ research frame, prints coverage statistics, and can optionally write the
 assembled frame to CSV for downstream evaluation or backtesting.
 
 For a companion demo that takes the same stored factors, builds an equal-
-weight composite, runs the generic multifactor backtest, and emits a
+weight composite, runs the generic factor backtest, and emits a
 portfolio tear sheet plus an equity-curve chart, use:
 
 ```bash
@@ -81,7 +95,7 @@ python -m tiger_factors.examples.factor_store_multi_factor_backtest_demo \
   --weights-json '{"BM": 0.6, "FSCORE": 0.3, "BMFSCORE": 0.1}'
 ```
 
-## Factor Diagnostics and Multifactors Screening
+## Factor Diagnostics and Screening
 
 If a saved factor does not produce a report, the most common causes are:
 
@@ -89,7 +103,7 @@ If a saved factor does not produce a report, the most common causes are:
 - the factor is too sparse, constant, or almost binary
 - cleaning fails because `max_loss` is exceeded or quantile/binning is not possible
 
-You can inspect those cases and run a lightweight multifactor screen with:
+You can inspect those cases and run a lightweight screening workflow with:
 
 ```bash
 python -m tiger_factors.multifactor_evaluation.examples.multifactors_screening_demo \
@@ -106,9 +120,16 @@ python -m tiger_factors.examples.single_factor_screening
 
 For a full sweep over all `alpha_*` factors, add `--all-factors`.
 
-The demo uses `tiger_factors.factor_evaluation.evaluate_factor_panel()` for single-factor diagnostics and
-`tiger_factors.multifactor_evaluation.screen_factor_metrics()` for the shared screening
-rules. It does not persist anything unless `--persist-outputs` is set.
+The preferred split is:
+
+- `tiger_factors.factor_evaluation.evaluate_factor_panel()` for single-factor diagnostics
+- `tiger_factors.factor_screener` for screening and factor-spec selection
+- `tiger_factors.factor_allocation` for factor-level weighting
+- `tiger_factors.factor_backtest` for return-based backtesting
+
+`tiger_factors.multifactor_evaluation` is still available for analysis and
+report generation. It does not own the screening / allocation / backtest
+workflow anymore.
 
 For a compact end-to-end demo that starts from raw prices, builds three toy
 factors, evaluates them individually, screens them as a small multi-factor

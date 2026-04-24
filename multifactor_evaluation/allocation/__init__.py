@@ -183,6 +183,19 @@ def optimize_factor_weights_with_riskfolio(
     return series.sort_index()
 
 
+def allocate_from_return_panel(
+    factor_return_panel: pd.DataFrame,
+    *,
+    config: RiskfolioConfig | None = None,
+) -> pd.Series:
+    """Allocate weights directly from a factor return panel.
+
+    This is the return-only allocation entrypoint. It is intentionally thin
+    and reuses the same optimizer as the factor-based path.
+    """
+    return optimize_factor_weights_with_riskfolio(factor_return_panel, config=config)
+
+
 def allocate_selected_factors(
     factor_dict: dict[str, pd.Series | pd.DataFrame],
     prices: pd.DataFrame,
@@ -225,6 +238,7 @@ def allocate_selected_factors(
 __all__ = [
     "LongShortReturnConfig",
     "RiskfolioConfig",
+    "allocate_from_return_panel",
     "allocate_selected_factors",
     "build_long_short_return_panel",
     "compute_factor_long_short_returns",

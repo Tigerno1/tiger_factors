@@ -563,6 +563,7 @@ class TigerFactorLibrary:
         provider: str = "tiger",
         freq: str = "1d",
         variant: str | None = None,
+        group: str | None = None,
         codes: list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
@@ -583,6 +584,7 @@ class TigerFactorLibrary:
             freq=freq,
             table_name=str(factor_name).strip().lower(),
             variant=variant,
+            group=group,
         )
         factor_df = store.get_factor(spec, start=start, end=end, engine="pandas")
         if not isinstance(factor_df, pd.DataFrame) or factor_df.empty:
@@ -623,6 +625,7 @@ class TigerFactorLibrary:
         provider: str = "tiger",
         freq: str = "1d",
         variant: str | None = None,
+        group: str | None = None,
         codes: list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
@@ -633,6 +636,7 @@ class TigerFactorLibrary:
             provider=provider,
             freq=freq,
             variant=variant,
+            group=group,
             codes=codes,
             start=start,
             end=end,
@@ -658,6 +662,7 @@ class TigerFactorLibrary:
         provider: str = "tiger",
         freq: str = "1d",
         variant: str | None = None,
+        group: str | None = None,
         codes: list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
@@ -670,6 +675,7 @@ class TigerFactorLibrary:
                 provider=provider,
                 freq=freq,
                 variant=variant,
+                group=group,
                 codes=codes,
                 start=start,
                 end=end,
@@ -690,6 +696,7 @@ class TigerFactorLibrary:
         provider: str,
         freq: str,
         variant: str | None,
+        group: str | None = None,
     ) -> FactorSpec:
         return FactorSpec(
             provider=provider,
@@ -698,6 +705,7 @@ class TigerFactorLibrary:
             freq=freq,
             table_name=str(factor_name).strip().lower(),
             variant=variant,
+            group=group,
         )
 
     def _build_multi_factor_frame_sql(
@@ -772,6 +780,7 @@ class TigerFactorLibrary:
         provider: str,
         freq: str,
         variant: str | None,
+        group: str | None,
         codes: list[str] | None,
         start: str | None,
         end: str | None,
@@ -784,6 +793,7 @@ class TigerFactorLibrary:
                 provider=provider,
                 freq=freq,
                 variant=variant,
+                group=group,
             )
             paths = store._dataset_paths_for_query(spec, start=start, end=end)
             if not paths:
@@ -819,6 +829,7 @@ class TigerFactorLibrary:
         provider: str = "tiger",
         freq: str = "1d",
         variant: str | None = None,
+        group: str | None = None,
         codes: list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
@@ -831,6 +842,7 @@ class TigerFactorLibrary:
                 provider=provider,
                 freq=freq,
                 variant=variant,
+                group=group,
                 codes=codes,
                 start=start,
                 end=end,
@@ -841,6 +853,7 @@ class TigerFactorLibrary:
             provider=provider,
             freq=freq,
             variant=variant,
+            group=group,
             codes=codes,
             start=start,
             end=end,

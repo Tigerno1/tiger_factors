@@ -1,16 +1,23 @@
 # Tiger Multifactor Evaluation
 
-`tiger_factors.multifactor_evaluation` is the Tiger-native layer for
-factor screening, factor blending, cross-sectional backtesting, and portfolio
-comparison.
+`tiger_factors.multifactor_evaluation` is the Tiger-native analysis and
+reporting layer for factor and portfolio research.
 
-It sits above `tiger_factors.factor_frame` and above the report layers used for
-positions, trades, and portfolio tear sheets:
+The preferred workflow is now split across dedicated modules:
 
-- `factor_frame` builds the long research tables and model scores
-- `multifactor_evaluation` screens, blends, allocates, and backtests factor
-  panels
-- `multifactor_evaluation.reporting` renders local positions / trades / portfolio reports
+- `tiger_factors.factor_screener`
+  - single-factor screening
+  - correlation screening
+  - selected `FactorSpec` outputs
+- `tiger_factors.factor_allocation`
+  - factor-level allocation from return panels
+- `tiger_factors.factor_backtest`
+  - return-based backtesting
+- `tiger_factors.multifactor_evaluation`
+  - analysis, diagnostics, tear sheets, and portfolio reporting
+
+It still sits above `tiger_factors.factor_frame` and above the report layers
+used for positions, trades, and portfolio tear sheets.
 
 ## CSM integration
 
@@ -32,6 +39,10 @@ can be used through this package in three ways:
   - fit the model, build a selection panel, and run `run_factor_backtest(...)`
 - `run_factor_backtest(...)`
   - accept any wide date x code panel, including CSM score panels
+
+These helpers are kept here for compatibility and model-specific workflows,
+but the general factor screening / allocation / backtest split lives in the
+dedicated modules above.
 
 ## Typical flow
 

@@ -1,6 +1,15 @@
 # Multifactors Evaluation Examples
 
-This folder contains minimal examples for screening factors in `tiger_factors.multifactor_evaluation`.
+This folder contains legacy and compatibility examples around registry
+screening, correlation analysis, CSM backtests, and multifactor report
+generation.
+
+For the preferred spec-first factor workflow, use:
+
+- `tiger_factors.factor_screener`
+- `tiger_factors.factor_allocation`
+- `tiger_factors.factor_backtest`
+- `tiger_factors.multifactor_evaluation` for analysis and reporting
 
 Scripts included here:
 

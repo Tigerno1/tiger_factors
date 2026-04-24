@@ -8,27 +8,11 @@ import numpy as np
 import pandas as pd
 
 from tiger_factors.factor_evaluation.utils import period_to_label
-from tiger_factors.factor_evaluation.performance import mean_return_by_quantile
-from tiger_factors.factor_evaluation.utils import (
-    get_clean_factor_and_forward_returns as tiger_clean_factor_and_forward_returns,
-)
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
-from tiger_factors.factor_store import TigerFactorLibrary
-from tiger_factors.multifactor_evaluation.allocation import LongShortReturnConfig
-from tiger_factors.multifactor_evaluation.allocation import compute_factor_long_short_returns
-from tiger_factors.multifactor_evaluation.allocation import resolve_return_period
 from tiger_factors.factor_screener.screening import FactorMetricFilterConfig
 from tiger_factors.factor_screener.screening import screen_factor_metrics
-from tiger_factors.multifactor_evaluation._inputs import coerce_factor_series
 from tiger_factors.factor_screener.selection import select_non_redundant_factors
-
-
-def _coerce_factor_names(factor_names: Iterable[str]) -> tuple[str, ...]:
-    names = [str(name).strip() for name in factor_names if str(name).strip()]
-    if not names:
-        raise ValueError("factor_names must not be empty")
-    return tuple(names)
 
 
 def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Series:
@@ -69,53 +53,6 @@ def _pick_return_column(frame: pd.DataFrame, *, preferred_period: str | int | pd
     raise KeyError(f"Could not infer a return column. Available columns: {columns!r}")
 
 
-def _top_quantile_series_from_mean_returns(
-    factor_data: pd.DataFrame,
-    *,
-    selected_period: str | int | pd.Timedelta,
-) -> pd.Series | None:
-    mean_ret, _ = mean_return_by_quantile(
-        factor_data,
-        by_date=True,
-        by_group=False,
-        demeaned=False,
-    )
-    period_label = period_to_label(selected_period)
-    if period_label not in mean_ret.columns:
-        return None
-    frame = mean_ret[period_label].unstack("factor_quantile").sort_index()
-    if frame.empty:
-        return None
-    quantile_cols = pd.Index(frame.columns)
-    if quantile_cols.empty:
-        return None
-    top_quantile = pd.to_numeric(quantile_cols, errors="coerce").max()
-    if pd.isna(top_quantile):
-        top_quantile = quantile_cols[-1]
-    series = pd.to_numeric(frame[top_quantile], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    series.index = pd.to_datetime(series.index, errors="coerce")
-    series = series[~series.index.isna()].sort_index()
-    series.name = "long_only"
-    return series
-
-
-def _build_factor_data(
-    factor_panel: pd.DataFrame,
-    price_panel: pd.DataFrame,
-    *,
-    selected_period: str | int | pd.Timedelta,
-) -> Any:
-    return tiger_clean_factor_and_forward_returns(
-        factor=coerce_factor_series(factor_panel),
-        prices=price_panel,
-        quantiles=5,
-        periods=(selected_period,),
-        filter_zscore=20,
-        max_loss=0.35,
-        cumulative_returns=True,
-    )
-
-
 def _series_to_long_frame(
     series: pd.Series,
     *,
@@ -139,42 +76,139 @@ def _series_to_long_frame(
     )
 
 
+def _factor_panel_data_profile(panel: pd.DataFrame) -> dict[str, float | int]:
+    if panel.empty:
+        return {
+            "data_rows": 0,
+            "data_dates": 0,
+            "data_codes": 0,
+            "data_non_na": 0,
+            "data_coverage": 0.0,
+        }
+
+    normalized = panel.copy()
+    normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+    normalized = normalized.loc[~normalized.index.isna()]
+    non_na = int(normalized.notna().sum().sum())
+    total = int(normalized.size)
+    coverage = float(non_na / total) if total > 0 else 0.0
+    return {
+        "data_rows": total,
+        "data_dates": int(normalized.index.nunique()),
+        "data_codes": int(normalized.columns.nunique()),
+        "data_non_na": non_na,
+        "data_coverage": coverage,
+    }
+
+
+def _factor_frame_to_panel(frame: pd.DataFrame, *, factor_name: str) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    normalized = frame.copy()
+    if "date_" in normalized.columns:
+        normalized["date_"] = pd.to_datetime(normalized["date_"], errors="coerce")
+    if "code" in normalized.columns:
+        normalized["code"] = normalized["code"].astype(str)
+
+    if {"date_", "code"}.issubset(normalized.columns):
+        value_candidates = [
+            column
+            for column in normalized.columns
+            if column not in {"date_", "code"}
+            and pd.api.types.is_numeric_dtype(normalized[column])
+        ]
+        if not value_candidates:
+            return pd.DataFrame()
+        value_column = "value" if "value" in value_candidates else value_candidates[0]
+        panel = normalized.pivot_table(index="date_", columns="code", values=value_column, aggfunc="last")
+        panel.index = pd.to_datetime(panel.index, errors="coerce")
+        panel = panel.loc[~panel.index.isna()].sort_index()
+        panel.columns = panel.columns.astype(str)
+        panel.columns.name = factor_name
+        return panel
+
+    if isinstance(normalized.index, pd.DatetimeIndex):
+        panel = normalized.copy()
+        panel.index = pd.to_datetime(panel.index, errors="coerce")
+        panel = panel.loc[~panel.index.isna()].sort_index()
+        panel.columns = panel.columns.astype(str)
+        panel.columns.name = factor_name
+        return panel
+
+    return pd.DataFrame()
+
+
+def _load_factor_panel_from_store(
+    store: FactorStore,
+    spec: FactorSpec,
+) -> pd.DataFrame:
+    try:
+        frame = store.get_factor(spec, engine="pandas")
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    panel = _factor_frame_to_panel(frame, factor_name=spec.table_name)
+    return panel if isinstance(panel, pd.DataFrame) else pd.DataFrame()
+
+
+def _load_factor_panels_from_store(
+    store: FactorStore,
+    specs: Iterable[FactorSpec],
+) -> dict[str, pd.DataFrame]:
+    panels: dict[str, pd.DataFrame] = {}
+    for spec in specs:
+        panel = _load_factor_panel_from_store(store, spec)
+        if not panel.empty:
+            panels[spec.table_name] = panel
+    return panels
+
+
+def _factor_panel_is_sufficient(
+    panel: pd.DataFrame,
+    *,
+    min_observations: int | None,
+    min_dates: int | None,
+    min_codes: int | None,
+    min_coverage: float | None,
+) -> tuple[bool, list[str], dict[str, float | int]]:
+    profile = _factor_panel_data_profile(panel)
+    failed_rules: list[str] = []
+
+    data_non_na = int(profile["data_non_na"])
+    data_dates = int(profile["data_dates"])
+    data_codes = int(profile["data_codes"])
+    data_coverage = float(profile["data_coverage"])
+
+    if min_observations is not None and data_non_na < int(min_observations):
+        failed_rules.append(f"data_non_na<{int(min_observations)}")
+    if min_dates is not None and data_dates < int(min_dates):
+        failed_rules.append(f"data_dates<{int(min_dates)}")
+    if min_codes is not None and data_codes < int(min_codes):
+        failed_rules.append(f"data_codes<{int(min_codes)}")
+    if min_coverage is not None and data_coverage < float(min_coverage):
+        failed_rules.append(f"data_coverage<{float(min_coverage)}")
+
+    return not failed_rules, failed_rules, profile
+
+
 @dataclass(frozen=True)
 class FactorScreenerSpec:
-    factor_names: tuple[str, ...]
-    provider: str = "tiger"
-    region: str = "us"
-    sec_type: str = "stock"
-    freq: str = "1d"
-    variant: str | None = None
-    price_panel: pd.DataFrame | None = None
-    summary_section: str = "summary"
-    returns_section: str = "returns"
-    summary_table_name: str | None = None
-    return_table_name: str = "factor_portfolio_returns"
-    preferred_return_period: str | int | pd.Timedelta | None = None
-    return_modes: tuple[str, ...] = ("long_short", "long_only")
     selection_threshold: float | None = 0.75
     selection_score_field: str = "fitness"
+    correlation_method: str = "greedy"
+    ic_correlation_method: str = "greedy"
+    min_factor_observations: int | None = 5
+    min_factor_dates: int | None = 3
+    min_factor_codes: int | None = 3
+    min_factor_coverage: float | None = 0.01
     screening_config: FactorMetricFilterConfig = field(default_factory=FactorMetricFilterConfig)
-
-    def normalized_factor_names(self) -> tuple[str, ...]:
-        return _coerce_factor_names(self.factor_names)
-
-    def factor_spec(self, factor_name: str) -> FactorSpec:
-        return FactorSpec(
-            provider=self.provider,
-            region=self.region,
-            sec_type=self.sec_type,
-            freq=self.freq,
-            table_name=str(factor_name).strip().lower(),
-            variant=self.variant,
-        )
 
 
 @dataclass(frozen=True)
 class FactorScreenerResult:
     spec: FactorScreenerSpec
+    factor_specs: tuple[FactorSpec, ...]
     screened_at: pd.Timestamp
     summary: pd.DataFrame
     selection_summary: pd.DataFrame
@@ -197,10 +231,20 @@ class FactorScreenerResult:
         return frame["factor_name"].astype(str).tolist()
 
     @property
+    def selected_factor_specs(self) -> list[FactorSpec]:
+        spec_map = {spec.table_name: spec for spec in self.factor_specs}
+        return [spec_map[name] for name in self.selected_factor_names if name in spec_map]
+
+    @property
     def screened_factor_names(self) -> list[str]:
         if self.summary.empty or "factor_name" not in self.summary.columns:
             return []
         return self.summary["factor_name"].astype(str).tolist()
+
+    @property
+    def screened_factor_specs(self) -> list[FactorSpec]:
+        spec_map = {spec.table_name: spec for spec in self.factor_specs}
+        return [spec_map[name] for name in self.screened_factor_names if name in spec_map]
 
     @property
     def rejected_factor_names(self) -> list[str]:
@@ -212,29 +256,39 @@ class FactorScreenerResult:
         return frame["factor_name"].astype(str).tolist()
 
     @property
-    def time_range(self) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-        if self.return_panel.empty:
-            return None, None
-        index = pd.DatetimeIndex(self.return_panel.index).dropna().sort_values()
-        if index.empty:
-            return None, None
-        return index[0], index[-1]
+    def rejected_factor_specs(self) -> list[FactorSpec]:
+        spec_map = {spec.table_name: spec for spec in self.factor_specs}
+        return [spec_map[name] for name in self.rejected_factor_names if name in spec_map]
 
     def to_summary(self) -> dict[str, Any]:
-        start, end = self.time_range
+        if self.return_panel.empty:
+            return_start = None
+            return_end = None
+        else:
+            index = pd.DatetimeIndex(self.return_panel.index).dropna().sort_values()
+            if index.empty:
+                return_start = None
+                return_end = None
+            else:
+                return_start = index[0].isoformat()
+                return_end = index[-1].isoformat()
         return {
             "screened_at": self.screened_at.isoformat(),
-            "factor_count": int(len(self.spec.factor_names)),
+            "factor_count": int(len(self.factor_specs)),
             "screened_factor_names": self.screened_factor_names,
             "selected_factor_names": self.selected_factor_names,
             "selected_count": int(len(self.selected_factor_names)),
             "rejected_factor_names": self.rejected_factor_names,
             "missing_return_factors": list(self.missing_return_factors),
-            "return_start": None if start is None else start.isoformat(),
-            "return_end": None if end is None else end.isoformat(),
+            "selection_threshold": self.spec.selection_threshold,
+            "selection_score_field": self.spec.selection_score_field,
+            "correlation_method": self.spec.correlation_method,
+            "ic_correlation_method": self.spec.ic_correlation_method,
+            "return_start": return_start,
+            "return_end": return_end,
             "summary_rows": int(len(self.summary)),
             "return_long_rows": int(len(self.return_long)),
-            "return_modes": list(self.spec.return_modes),
+            "return_modes": sorted({str(key.split(":", 1)[1]) for key in self.return_series if ":" in key}),
         }
 
 
@@ -243,65 +297,67 @@ class FactorScreener:
         self,
         spec: FactorScreenerSpec,
         *,
+        factor_specs: tuple[FactorSpec, ...],
         store: FactorStore | None = None,
     ) -> None:
+        if not factor_specs:
+            raise ValueError("factor_specs must not be empty")
         self.spec = spec
+        self.factor_specs = tuple(factor_specs)
         self.store = store or FactorStore()
-        self.library = TigerFactorLibrary(
-            store=self.store,
-            region=self.spec.region,
-            sec_type=self.spec.sec_type,
-            price_provider=self.spec.provider,
-            verbose=False,
-        )
 
-    def _summary_frame(self, factor_name: str) -> pd.DataFrame:
-        factor_spec = self.spec.factor_spec(factor_name)
-        section = self.store.evaluation.section(factor_spec, self.spec.summary_section)
-        if self.spec.summary_table_name is None:
-            frame = section.get_table()
-        else:
-            frame = section.get_table(self.spec.summary_table_name)
+    def _summary_frame(self, factor_spec: FactorSpec) -> pd.DataFrame:
+        section = self.store.evaluation.section(factor_spec, "summary")
+        frame = section.get_table()
 
         if frame.empty:
-            raise ValueError(f"summary table is empty for factor {factor_name!r}")
+            raise ValueError(f"summary table is empty for factor {factor_spec.table_name!r}")
         if len(frame) != 1:
             raise ValueError(
                 "summary table must contain exactly one row per factor; "
-                f"got {len(frame)} rows for {factor_name!r}"
+                f"got {len(frame)} rows for {factor_spec.table_name!r}"
             )
 
         normalized = frame.copy().reset_index(drop=True)
         if "factor_name" not in normalized.columns:
-            normalized.insert(0, "factor_name", factor_name)
+            normalized.insert(0, "factor_name", factor_spec.table_name)
         else:
-            normalized["factor_name"] = normalized["factor_name"].fillna(factor_name).astype(str)
+            normalized["factor_name"] = normalized["factor_name"].fillna(factor_spec.table_name).astype(str)
         if "factor_name" not in normalized.columns:
-            normalized.insert(0, "factor_name", factor_name)
+            normalized.insert(0, "factor_name", factor_spec.table_name)
         return normalized
 
-    def _stored_long_short_series(self, factor_name: str) -> pd.Series | None:
-        factor_spec = self.spec.factor_spec(factor_name)
-        section = self.store.evaluation.section(factor_spec, self.spec.returns_section)
+    def _stored_long_short_series(self, factor_spec: FactorSpec) -> pd.Series | None:
+        section = self.store.evaluation.section(factor_spec, "returns")
         try:
-            return_frame = section.get_table(self.spec.return_table_name)
+            return_frame = section.get_table("factor_portfolio_returns")
         except FileNotFoundError:
             return None
         if isinstance(return_frame, pd.Series):
-            return _normalize_return_series(return_frame, factor_name=factor_name)
+            return _normalize_return_series(return_frame, factor_name=factor_spec.table_name)
         if not isinstance(return_frame, pd.DataFrame) or return_frame.empty:
             return None
-        column = _pick_return_column(return_frame, preferred_period=self.spec.preferred_return_period)
+        if "date_" in return_frame.columns:
+            date_index = pd.to_datetime(return_frame["date_"], errors="coerce")
+            numeric_columns = [
+                column
+                for column in return_frame.columns
+                if column != "date_" and pd.api.types.is_numeric_dtype(return_frame[column])
+            ]
+            if numeric_columns:
+                column = _pick_return_column(return_frame[numeric_columns])
+                series = pd.Series(pd.to_numeric(return_frame[column], errors="coerce").to_numpy(), index=date_index, name=factor_spec.table_name)
+                return _normalize_return_series(series, factor_name=factor_spec.table_name)
+        column = _pick_return_column(return_frame)
         series = return_frame[column]
         if isinstance(series, pd.DataFrame):
             series = series.squeeze(axis=1)
-        return _normalize_return_series(series, factor_name=factor_name)
+        return _normalize_return_series(series, factor_name=factor_spec.table_name)
 
-    def _stored_long_only_series(self, factor_name: str) -> pd.Series | None:
-        factor_spec = self.spec.factor_spec(factor_name)
-        section = self.store.evaluation.section(factor_spec, self.spec.returns_section)
+    def _stored_long_only_series(self, factor_spec: FactorSpec) -> pd.Series | None:
+        section = self.store.evaluation.section(factor_spec, "returns")
         candidates = ("mean_return_by_quantile_by_date", "mean_return_by_quantile")
-        period_label = period_to_label(resolve_return_period(self.spec.preferred_return_period))
+        period_label = period_to_label(1)
         for table_name in candidates:
             try:
                 frame = section.get_table(table_name)
@@ -316,7 +372,7 @@ class FactorScreener:
                 quantile_cols = pd.Index(quantile_frame.columns)
                 numeric_quantiles = pd.to_numeric(quantile_cols, errors="coerce")
                 top_quantile = numeric_quantiles.max() if numeric_quantiles.notna().any() else quantile_cols[-1]
-                return _normalize_return_series(quantile_frame[top_quantile], factor_name=factor_name)
+                return _normalize_return_series(quantile_frame[top_quantile], factor_name=factor_spec.table_name)
             if isinstance(frame.columns, pd.MultiIndex) and "factor_quantile" in frame.columns.names:
                 try:
                     level = frame.columns.names.index("factor_quantile")
@@ -324,66 +380,29 @@ class FactorScreener:
                     if period_label in frame.columns:
                         quantile_frame = frame[period_label].copy()
                         if isinstance(quantile_frame, pd.Series):
-                            return _normalize_return_series(quantile_frame, factor_name=factor_name)
+                            return _normalize_return_series(quantile_frame, factor_name=factor_spec.table_name)
                 except Exception:
                     continue
         return None
 
-    def _return_modes(self, factor_name: str) -> dict[str, pd.Series]:
-        factor_panel = self.library.load_factor_panel(
-            factor_name=factor_name,
-            provider=self.spec.provider,
-            freq=self.spec.freq,
-            variant=self.spec.variant,
-            engine="pandas",
-        )
+    def _return_modes(self, factor_spec: FactorSpec) -> dict[str, pd.Series]:
         return_modes: dict[str, pd.Series] = {}
-        if isinstance(factor_panel, pd.DataFrame) and not factor_panel.empty and self.spec.price_panel is not None:
-            selected_period = resolve_return_period(self.spec.preferred_return_period)
-            try:
-                prepared = _build_factor_data(
-                    factor_panel,
-                    self.spec.price_panel,
-                    selected_period=selected_period,
-                )
-                if "long_short" in self.spec.return_modes:
-                    series = compute_factor_long_short_returns(
-                        factor_panel,
-                        self.spec.price_panel,
-                        config=LongShortReturnConfig(
-                            periods=(selected_period,),
-                            selected_period=selected_period,
-                        ),
-                    )
-                    if isinstance(series, pd.Series) and not series.empty:
-                        return_modes["long_short"] = _normalize_return_series(series, factor_name=factor_name)
-                if "long_only" in self.spec.return_modes:
-                    long_only = _top_quantile_series_from_mean_returns(
-                        prepared.factor_data,
-                        selected_period=selected_period,
-                    )
-                    if long_only is not None and not long_only.empty:
-                        return_modes["long_only"] = _normalize_return_series(long_only, factor_name=factor_name)
-            except Exception:
-                pass
-
-        if "long_short" in self.spec.return_modes and "long_short" not in return_modes:
-            stored = self._stored_long_short_series(factor_name)
-            if stored is not None and not stored.empty:
-                return_modes["long_short"] = stored
-        if "long_only" in self.spec.return_modes and "long_only" not in return_modes:
-            stored = self._stored_long_only_series(factor_name)
-            if stored is not None and not stored.empty:
-                return_modes["long_only"] = stored
+        stored = self._stored_long_short_series(factor_spec)
+        if stored is not None and not stored.empty:
+            return_modes["long_short"] = stored
+        stored = self._stored_long_only_series(factor_spec)
+        if stored is not None and not stored.empty:
+            return_modes["long_only"] = stored
         return return_modes
 
-    def _build_return_long_table(self, selected_names: list[str]) -> tuple[dict[str, pd.Series], pd.DataFrame, list[str]]:
+    def _build_return_long_table(self, selected_specs: list[FactorSpec]) -> tuple[dict[str, pd.Series], pd.DataFrame, list[str]]:
         return_series: dict[str, pd.Series] = {}
         missing_return_factors: list[str] = []
         return_long_frames: list[pd.DataFrame] = []
 
-        for factor_name in selected_names:
-            modes = self._return_modes(factor_name)
+        for factor_spec in selected_specs:
+            factor_name = factor_spec.table_name
+            modes = self._return_modes(factor_spec)
             if not modes:
                 missing_return_factors.append(factor_name)
                 continue
@@ -412,10 +431,9 @@ class FactorScreener:
         return return_series, return_long, missing_return_factors
 
     def run(self) -> FactorScreenerResult:
-        factor_names = self.spec.normalized_factor_names()
         summary_frames: list[pd.DataFrame] = []
-        for factor_name in factor_names:
-            summary_frames.append(self._summary_frame(factor_name))
+        for factor_spec in self.factor_specs:
+            summary_frames.append(self._summary_frame(factor_spec))
 
         combined_summary = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
         screened_summary = (
@@ -438,13 +456,57 @@ class FactorScreener:
         )
         factor_panels: dict[str, pd.DataFrame] = {}
         if screened_names:
-            factor_panels = self.library.load_factor_panels(
-                factor_names=screened_names,
-                provider=self.spec.provider,
-                freq=self.spec.freq,
-                variant=self.spec.variant,
-            )
-            factor_panels = {name: panel for name, panel in factor_panels.items() if isinstance(panel, pd.DataFrame) and not panel.empty}
+            selected_specs = [spec for spec in self.factor_specs if spec.table_name in set(screened_names)]
+            factor_panels = _load_factor_panels_from_store(self.store, selected_specs)
+
+        if not screened_summary.empty and "factor_name" in screened_summary.columns:
+            data_profile_rows: list[dict[str, float | int]] = []
+            data_usable_flags: list[bool] = []
+            data_failed_rules: list[list[str]] = []
+            for _, row in screened_summary.iterrows():
+                factor_name = str(row.get("factor_name", "")).strip()
+                panel = factor_panels.get(factor_name)
+                if panel is None or panel.empty:
+                    data_profile_rows.append(
+                        {
+                            "data_rows": 0,
+                            "data_dates": 0,
+                            "data_codes": 0,
+                            "data_non_na": 0,
+                            "data_coverage": 0.0,
+                        }
+                    )
+                    data_usable_flags.append(False)
+                    data_failed_rules.append(["missing_factor_panel"])
+                    continue
+
+                data_usable, failed_rules, profile = _factor_panel_is_sufficient(
+                    panel,
+                    min_observations=self.spec.min_factor_observations,
+                    min_dates=self.spec.min_factor_dates,
+                    min_codes=self.spec.min_factor_codes,
+                    min_coverage=self.spec.min_factor_coverage,
+                )
+                data_profile_rows.append(profile)
+                data_usable_flags.append(data_usable)
+                data_failed_rules.append(failed_rules)
+
+            profile_frame = pd.DataFrame(data_profile_rows)
+            for column in profile_frame.columns:
+                screened_summary[column] = profile_frame[column].to_numpy()
+            screened_summary["data_usable"] = data_usable_flags
+            screened_summary["data_failed_rules"] = data_failed_rules
+            if "usable" in screened_summary.columns:
+                screened_summary["usable"] = screened_summary["usable"].fillna(False) & screened_summary["data_usable"].fillna(False)
+            else:
+                screened_summary["usable"] = screened_summary["data_usable"].fillna(False)
+
+        screened_names = (
+            screened_summary.loc[screened_summary["usable"].fillna(False), "factor_name"].astype(str).tolist()
+            if not screened_summary.empty and "usable" in screened_summary.columns and "factor_name" in screened_summary.columns
+            else []
+        )
+        factor_panels = {name: panel for name, panel in factor_panels.items() if name in screened_names}
 
         if self.spec.selection_threshold is not None and len(factor_panels) > 1:
             score_field = self.spec.selection_score_field
@@ -473,35 +535,24 @@ class FactorScreener:
                 if score_field is not None:
                     selection_summary["selected_score"] = selection_summary[score_field]
 
-        return_series, return_long, missing_return_factors = self._build_return_long_table(selected_names)
-
-        primary_mode = (
-            "long_short"
-            if "long_short" in self.spec.return_modes
-            else (self.spec.return_modes[0] if self.spec.return_modes else "long_short")
-        )
-        primary_series: dict[str, pd.Series] = {
-            key.split(":", 1)[0]: series
-            for key, series in return_series.items()
-            if key.endswith(f":{primary_mode}")
-        }
-        return_panel = pd.DataFrame(primary_series).sort_index() if primary_series else pd.DataFrame()
-        if not return_panel.empty:
-            return_panel.index = pd.to_datetime(return_panel.index, errors="coerce")
-            return_panel = return_panel.loc[~return_panel.index.isna()].sort_index()
-
-        if not return_long.empty and "factor" in return_long.columns:
-            range_table = return_long.groupby("factor")["date_"].agg(["min", "max"]).rename(
-                columns={"min": "return_start", "max": "return_end"}
-            )
-            if not screened_summary.empty and "factor_name" in screened_summary.columns:
-                screened_summary = screened_summary.merge(range_table, how="left", left_on="factor_name", right_index=True)
-            if not selection_summary.empty and "factor_name" in selection_summary.columns:
-                selection_summary = selection_summary.merge(range_table, how="left", left_on="factor_name", right_index=True)
-                selection_summary["screened_at"] = screened_at.isoformat()
+        selected_factor_specs = [spec for spec in self.factor_specs if spec.table_name in set(selected_names)]
+        return_series, return_long, missing_return_factors = self._build_return_long_table(selected_factor_specs)
+        return_panel = pd.DataFrame()
+        if not return_long.empty and "return_mode" in return_long.columns:
+            available_modes = [str(mode) for mode in return_long["return_mode"].dropna().astype(str).unique().tolist()]
+            primary_mode = "long_short" if "long_short" in available_modes else ("long_only" if "long_only" in available_modes else available_modes[0])
+            primary_frame = return_long.loc[return_long["return_mode"] == primary_mode].copy()
+            if not primary_frame.empty:
+                return_panel = (
+                    primary_frame.pivot_table(index="date_", columns="factor", values="return", aggfunc="last")
+                    .sort_index()
+                )
+                return_panel.index = pd.to_datetime(return_panel.index, errors="coerce")
+                return_panel = return_panel.loc[~return_panel.index.isna()].sort_index()
 
         return FactorScreenerResult(
             spec=self.spec,
+            factor_specs=self.factor_specs,
             screened_at=screened_at,
             summary=screened_summary.reset_index(drop=True) if not screened_summary.empty else screened_summary,
             selection_summary=selection_summary.reset_index(drop=True) if not selection_summary.empty else selection_summary,
@@ -513,42 +564,17 @@ class FactorScreener:
 
 
 def run_factor_screener(
-    factor_names: Iterable[str],
+    spec: FactorScreenerSpec,
+    factor_specs: Iterable[FactorSpec],
     *,
     store: FactorStore | None = None,
-    screening_config: FactorMetricFilterConfig | None = None,
-    provider: str = "tiger",
-    region: str = "us",
-    sec_type: str = "stock",
-    freq: str = "1d",
-    variant: str | None = None,
-    summary_section: str = "summary",
-    returns_section: str = "returns",
-    summary_table_name: str | None = None,
-    return_table_name: str = "factor_portfolio_returns",
-    preferred_return_period: str | int | pd.Timedelta | None = None,
-    return_modes: tuple[str, ...] = ("long_short", "long_only"),
-    selection_threshold: float | None = 0.75,
-    selection_score_field: str = "fitness",
 ) -> FactorScreenerResult:
-    spec = FactorScreenerSpec(
-        factor_names=_coerce_factor_names(factor_names),
-        provider=provider,
-        region=region,
-        sec_type=sec_type,
-        freq=freq,
-        variant=variant,
-        summary_section=summary_section,
-        returns_section=returns_section,
-        summary_table_name=summary_table_name,
-        return_table_name=return_table_name,
-        preferred_return_period=preferred_return_period,
-        return_modes=return_modes,
-        selection_threshold=selection_threshold,
-        selection_score_field=selection_score_field,
-        screening_config=screening_config or FactorMetricFilterConfig(),
-    )
-    return FactorScreener(spec, store=store).run()
+    resolved_specs = tuple(factor_specs)
+    return FactorScreener(
+        spec,
+        factor_specs=resolved_specs,
+        store=store,
+    ).run()
 
 
 __all__ = [

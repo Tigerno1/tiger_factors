@@ -6,17 +6,18 @@ This demo shows the intended boundary between the two modules:
 2. ``multifactor_evaluation`` takes the selected factors and builds the
    composite backtest plus report
 
-The script expects the factors and prices to already exist in the local Tiger
-factor store. It is intentionally explicit so you can swap in your own factor
-names, providers, and universe controls.
+The script expects the factor evaluation artifacts to already exist in the
+local Tiger factor store. It is intentionally explicit so you can swap in your
+own factor names, providers, and universe controls.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
+from dataclasses import asdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -31,11 +32,15 @@ os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CACHE_DIR))
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 from tiger_factors.factor_store import DEFAULT_FACTOR_STORE_ROOT
-from tiger_factors.factor_store import TigerFactorLibrary
+from tiger_factors.factor_store import FactorSpec
+from tiger_factors.factor_store import FactorStore
+from tiger_factors.factor_screener import FactorMetricFilterConfig
+from tiger_factors.factor_screener import FactorMarginalSelectionConfig
+from tiger_factors.factor_screener import FactorScreener
 from tiger_factors.factor_screener import FactorScreenerSpec
-from tiger_factors.factor_screener import run_factor_screener_flow
-from tiger_factors.multifactor_evaluation import MultifactorEvaluation
-from tiger_factors.multifactor_evaluation.backtest import multi_factor_backtest
+from tiger_factors.factor_allocation import allocate_from_return_panel
+from tiger_factors.factor_backtest import run_return_backtest
+from tiger_factors.multifactor_evaluation.reporting.analysis_report import create_analysis_report
 
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "tiger_analysis_outputs" / "factor_screener_multifactor_demo"
@@ -50,203 +55,186 @@ DEFAULT_FACTOR_NAMES = (
     "alpha_092",
 )
 
+@dataclass(frozen=True)
+class SingleFactorScreeningConfig:
+    min_fitness: float | None = 0.10
+    min_ic_mean: float | None = 0.01
+    min_rank_ic_mean: float | None = 0.01
+    min_sharpe: float | None = 0.40
+    max_turnover: float | None = 0.50
+    min_decay_score: float | None = 0.20
+    min_capacity_score: float | None = 0.20
+    max_correlation_penalty: float | None = 0.60
+    min_regime_robustness: float | None = 0.60
+    min_out_of_sample_stability: float | None = 0.60
+    sort_field: str = "fitness"
+    tie_breaker_field: str = "ic_ir"
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Screen factors first, then run a multifactor backtest and report."
+    def metric_filter_config(self) -> FactorMetricFilterConfig:
+        return FactorMetricFilterConfig(
+            min_fitness=self.min_fitness,
+            min_ic_mean=self.min_ic_mean,
+            min_rank_ic_mean=self.min_rank_ic_mean,
+            min_sharpe=self.min_sharpe,
+            max_turnover=self.max_turnover,
+            min_decay_score=self.min_decay_score,
+            min_capacity_score=self.min_capacity_score,
+            max_correlation_penalty=self.max_correlation_penalty,
+            min_regime_robustness=self.min_regime_robustness,
+            min_out_of_sample_stability=self.min_out_of_sample_stability,
+            sort_field=self.sort_field,
+            tie_breaker_field=self.tie_breaker_field,
+        )
+
+
+@dataclass(frozen=True)
+class CorrelationScreeningConfig:
+    ic_horizon: int = 1
+    ic_min_names: int | None = 10
+    marginal_gain_score_fields: tuple[str, ...] = (
+        "directional_fitness",
+        "directional_ic_ir",
+        "directional_sharpe",
     )
-    parser.add_argument("--factor-root", default=str(DEFAULT_FACTOR_STORE_ROOT), help="Root directory of the Tiger factor store.")
-    parser.add_argument("--factor-provider", default="tiger", help="Provider namespace used when the factors were saved.")
-    parser.add_argument("--price-provider", default="yahoo", help="Price provider used for the matching close panel.")
-    parser.add_argument("--factor-variant", default=None, help="Optional factor variant used when the factors were saved.")
-    parser.add_argument("--region", default="us")
-    parser.add_argument("--sec-type", default="stock")
-    parser.add_argument("--freq", default="1d")
-    parser.add_argument("--factor-names", nargs="+", default=list(DEFAULT_FACTOR_NAMES), help="Candidate factors to screen.")
-    parser.add_argument("--codes", nargs="*", default=None, help="Optional explicit universe to keep.")
-    parser.add_argument("--start", default=None, help="Optional start date.")
-    parser.add_argument("--end", default=None, help="Optional end date.")
-    parser.add_argument(
-        "--selection-mode",
-        default="return_gain",
-        choices=("correlation", "conditional", "return_gain"),
-        help="How to do the final cross-factor selection.",
-    )
-    parser.add_argument(
-        "--return-gain-preset",
-        default="balanced",
-        choices=("balanced", "metric_focused", "return_focused", "robust"),
-        help="Preset used when selection_mode=return_gain.",
-    )
-    parser.add_argument("--long-pct", type=float, default=0.20)
-    parser.add_argument("--rebalance-freq", default="ME")
-    parser.add_argument("--annual-trading-days", type=int, default=252)
-    parser.add_argument("--transaction-cost-bps", type=float, default=5.0)
-    parser.add_argument("--slippage-bps", type=float, default=2.0)
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--report-name", default="factor_screener_multifactor_demo")
-    parser.add_argument("--open-browser", action="store_true")
-    return parser.parse_args()
+    marginal_gain_score_weights: tuple[float, ...] = (0.50, 0.25, 0.25)
+    marginal_gain_penalty_fields: tuple[str, ...] = ("turnover", "max_drawdown")
+    marginal_gain_penalty_weights: tuple[float, ...] = (0.20, 0.10)
+    marginal_gain_corr_weight: float = 0.50
+    marginal_gain_min_improvement: float = 0.0
+    marginal_gain_min_base_score: float | None = None
+    marginal_gain_standardize: bool = True
+
+    def marginal_gain_config(self) -> FactorMarginalSelectionConfig:
+        return FactorMarginalSelectionConfig(
+            score_fields=self.marginal_gain_score_fields,
+            score_weights=self.marginal_gain_score_weights,
+            penalty_fields=self.marginal_gain_penalty_fields,
+            penalty_weights=self.marginal_gain_penalty_weights,
+            corr_weight=self.marginal_gain_corr_weight,
+            min_improvement=self.marginal_gain_min_improvement,
+            min_base_score=self.marginal_gain_min_base_score,
+            standardize=self.marginal_gain_standardize,
+        )
 
 
-def _normalize_variant(value: str | None) -> str | None:
-    if value is None:
-        return None
-    token = str(value).strip()
-    if not token or token.lower() in {"none", "null", "na"}:
-        return None
-    return token
+FACTOR_ROOT = str(DEFAULT_FACTOR_STORE_ROOT)
+FACTOR_PROVIDER = "tiger"
+FACTOR_VARIANT: str | None = None
+FACTOR_GROUP: str | None = "core"
+REGION = "us"
+SEC_TYPE = "stock"
+FREQ = "1d"
+FACTOR_NAMES: tuple[str, ...] = DEFAULT_FACTOR_NAMES
+CODES: tuple[str, ...] | None = None
+START: str | None = "2020-01-01"
+END: str | None = "2024-12-31"
+LONG_PCT = 0.20
+REBALANCE_FREQ = "ME"
+ANNUAL_TRADING_DAYS = 252
+TRANSACTION_COST_BPS = 5.0
+SLIPPAGE_BPS = 2.0
+OUTPUT_DIR = str(DEFAULT_OUTPUT_DIR)
+REPORT_NAME = "factor_screener_multifactor_demo"
+OPEN_BROWSER = False
 
 
-def _infer_common_universe(
-    factor_panels: dict[str, pd.DataFrame],
-    *,
-    codes: list[str] | None = None,
-) -> tuple[list[str], str | None, str | None]:
-    if not factor_panels:
-        raise ValueError("factor_panels must not be empty")
-
-    common_dates: pd.Index | None = None
-    common_codes: set[str] | None = None
-    for panel in factor_panels.values():
-        if not isinstance(panel, pd.DataFrame) or panel.empty:
-            continue
-        dates = pd.Index(pd.to_datetime(panel.index, errors="coerce")).dropna()
-        panel_codes = {str(code) for code in panel.columns}
-        common_dates = dates if common_dates is None else common_dates.intersection(dates)
-        common_codes = panel_codes if common_codes is None else common_codes.intersection(panel_codes)
-
-    if common_dates is None or common_dates.empty:
-        raise ValueError("Could not infer any overlapping dates from the candidate factor panels.")
-    if common_codes is None or not common_codes:
-        raise ValueError("Could not infer any overlapping codes from the candidate factor panels.")
-
-    selected_codes = sorted(common_codes)
-    if codes is not None:
-        requested_codes = [str(code) for code in codes]
-        selected_codes = [code for code in requested_codes if code in common_codes]
-    if not selected_codes:
-        raise ValueError("No overlapping codes were found after applying the requested universe filter.")
-
-    start = str(pd.Timestamp(common_dates.min()).date())
-    end = str(pd.Timestamp(common_dates.max()).date())
-    return selected_codes, start, end
-
+CONFIG_SINGLE_FACTOR = SingleFactorScreeningConfig()
+CONFIG_CORRELATION = CorrelationScreeningConfig()
 
 def main() -> None:
-    args = parse_args()
-    output_dir = Path(args.output_dir)
-    variant = _normalize_variant(args.factor_variant)
-    factor_names = [str(name) for name in args.factor_names]
+    output_dir = Path(OUTPUT_DIR)
+    factor_names = [str(name) for name in FACTOR_NAMES]
+    store = FactorStore(root_dir=FACTOR_ROOT)
 
-    library = TigerFactorLibrary(
-        output_dir=args.factor_root,
-        price_provider=args.price_provider,
-        verbose=True,
-    )
+    candidate_specs = [
+        FactorSpec(
+            provider=FACTOR_PROVIDER,
+            region=REGION,
+            sec_type=SEC_TYPE,
+            freq=FREQ,
+            table_name=factor_name,
+            variant=FACTOR_VARIANT,
+            group=FACTOR_GROUP,
+        )
+        for factor_name in factor_names
+    ]
 
-    factor_panels = library.load_factor_panels(
-        factor_names=factor_names,
-        provider=args.factor_provider,
-        freq=args.freq,
-        variant=variant,
-        codes=args.codes,
-        start=args.start,
-        end=args.end,
-    )
-    if not factor_panels:
-        raise ValueError("No factor panels could be loaded from the store.")
-
-    selected_codes, inferred_start, inferred_end = _infer_common_universe(factor_panels, codes=args.codes)
-    start = args.start or inferred_start
-    end = args.end or inferred_end
-
-    close_panel = library.price_panel(
-        codes=selected_codes,
-        start=start,
-        end=end,
-        provider=args.price_provider,
-        field="close",
-    )
-    if close_panel.empty:
-        raise ValueError("Could not load a matching close panel for the selected universe.")
-
-    close_panel = close_panel.reindex(index=pd.to_datetime(close_panel.index, errors="coerce")).sort_index()
-    close_panel = close_panel.reindex(columns=selected_codes)
-
-    screener = FactorScreenerSpec(
-        factor_names=tuple(factor_names),
-        provider=args.factor_provider,
-        region=args.region,
-        sec_type=args.sec_type,
-        freq=args.freq,
-        variant=variant,
-        price_panel=close_panel,
-        preferred_return_period="1D",
-        return_modes=("long_short", "long_only"),
+    # 1) Build spec inputs for the screener. The screener will resolve factor
+    # evaluation artifacts from the store internally.
+    screener_spec = FactorScreenerSpec(
+        screening_config=CONFIG_SINGLE_FACTOR.metric_filter_config(),
         selection_threshold=0.75,
         selection_score_field="fitness",
+        correlation_method="marginal_gain",
+        ic_correlation_method="greedy",
     )
 
-    screener_result = run_factor_screener_flow(
-        [screener],
-        selection_mode=args.selection_mode,
-        return_gain_preset=args.return_gain_preset,
-        save_dir=output_dir / "screener",
+    # 2) Run the screener. It loads factor evaluation artifacts internally and
+    # returns the selected specs plus the selected return panel.
+    screener_result = FactorScreener(
+        screener_spec,
+        factor_specs=tuple(candidate_specs),
+        store=store,
+    ).run()
+    screener_result.save_detail(output_dir / "screener")
+
+    selected_factor_specs = screener_result.selected_factor_specs
+    return_panel = screener_result.return_panel
+
+    # 3) Allocate directly from the return panel.
+    factor_weights = allocate_from_return_panel(return_panel)
+
+    # 4) Backtest directly from the return panel.
+    backtest_result = run_return_backtest(
+        return_panel,
+        weights=factor_weights.to_dict(),
+        annual_trading_days=ANNUAL_TRADING_DAYS,
     )
 
-    selected_factor_names = screener_result.global_selected_factor_names or screener_result.selected_factor_names
-    if not selected_factor_names:
-        raise ValueError("Screener did not select any factors.")
-
-    selected_factor_panels = {
-        name: factor_panels[name].reindex(index=close_panel.index, columns=close_panel.columns)
-        for name in selected_factor_names
-        if name in factor_panels
-    }
-    if not selected_factor_panels:
-        raise ValueError("None of the selected factors were available in the loaded factor panels.")
-
-    backtest_result = multi_factor_backtest(
-        selected_factor_panels,
-        close_panel,
-        standardize=True,
-        long_pct=args.long_pct,
-        rebalance_freq=args.rebalance_freq,
-        long_short=True,
-        annual_trading_days=args.annual_trading_days,
-        transaction_cost_bps=args.transaction_cost_bps,
-        slippage_bps=args.slippage_bps,
-    )
-
-    factor_data = {name: selected_factor_panels[name] for name in selected_factor_panels}
-    evaluation = MultifactorEvaluation(
-        backtest=backtest_result["backtest"],
-        positions_frame=backtest_result["backtest"].attrs.get("positions"),
-        close_panel_frame=close_panel,
-        factor_data=factor_data,
-        output_dir=output_dir / "multifactor",
-        report_name=args.report_name,
-        capital_base=1_000_000.0,
-    )
-    bundle = evaluation.full(
-        backtest_result["backtest"],
-        output_dir=output_dir / "multifactor",
-        report_name=args.report_name,
-        open_browser=args.open_browser,
+    # 5) Generate an analysis report from the backtest returns only.
+    report = create_analysis_report(
+        returns=backtest_result["portfolio_returns"],
+        benchmark_returns=backtest_result["benchmark_returns"],
+        output_dir=output_dir / "analysis",
+        report_name=REPORT_NAME,
+        open_browser=OPEN_BROWSER,
     )
 
     manifest = {
-        "factor_root": str(args.factor_root),
+        "base_config": {
+            "factor_root": FACTOR_ROOT,
+            "factor_provider": FACTOR_PROVIDER,
+            "factor_variant": FACTOR_VARIANT,
+            "factor_group": FACTOR_GROUP,
+            "region": REGION,
+            "sec_type": SEC_TYPE,
+            "freq": FREQ,
+            "factor_names": list(FACTOR_NAMES),
+            "codes": None if CODES is None else list(CODES),
+            "long_pct": LONG_PCT,
+            "rebalance_freq": REBALANCE_FREQ,
+            "annual_trading_days": ANNUAL_TRADING_DAYS,
+            "transaction_cost_bps": TRANSACTION_COST_BPS,
+            "slippage_bps": SLIPPAGE_BPS,
+            "output_dir": OUTPUT_DIR,
+            "report_name": REPORT_NAME,
+            "open_browser": OPEN_BROWSER,
+        },
+        "single_factor_screening_config": asdict(CONFIG_SINGLE_FACTOR),
+        "correlation_screening_config": asdict(CONFIG_CORRELATION),
+        "selection_threshold": screener_spec.selection_threshold,
+        "selection_score_field": screener_spec.selection_score_field,
+        "correlation_method": screener_spec.correlation_method,
+        "ic_correlation_method": screener_spec.ic_correlation_method,
         "factor_names": factor_names,
-        "selected_factor_names": selected_factor_names,
-        "selection_mode": args.selection_mode,
-        "return_gain_preset": args.return_gain_preset,
-        "start": start,
-        "end": end,
+        "candidate_factor_specs": [asdict(spec) for spec in candidate_specs],
+        "selected_factor_names": [spec.table_name for spec in selected_factor_specs],
+        "selected_factor_specs": [asdict(spec) for spec in selected_factor_specs],
         "output_dir": str(output_dir),
-        "screener_detail_manifest": None if screener_result.detail_manifest is None else screener_result.detail_manifest.to_dict(),
-        "multifactor_report_path": None if bundle.report_path is None else str(bundle.report_path),
+        "return_panel_columns": list(return_panel.columns),
+        "factor_weights": {name: float(weight) for name, weight in factor_weights.items()},
+        "raw_screener_summary": screener_result.to_summary(),
+        "analysis_report_path": None if report.get_report(open_browser=False) is None else str(report.get_report(open_browser=False)),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "workflow_manifest.json").write_text(
@@ -256,12 +244,15 @@ def main() -> None:
 
     print("screened factors:")
     print(f"  candidates: {factor_names}")
-    print(f"  selected: {selected_factor_names}")
+    print(f"  selected specs: {[spec.table_name for spec in selected_factor_specs]}")
+    print(f"  return panel columns: {list(return_panel.columns)}")
+    print("\nallocation weights:")
+    print(pd.Series(factor_weights).to_string())
     print("\nbacktest stats:")
     print(pd.DataFrame(backtest_result["stats"]).T.to_string())
     print("\noutputs:")
     print(f"  screener detail: {output_dir / 'screener'}")
-    print(f"  multifactor report: {bundle.report_path}")
+    print(f"  analysis report: {report.get_report(open_browser=False)}")
     print(f"  workflow manifest: {output_dir / 'workflow_manifest.json'}")
 
 

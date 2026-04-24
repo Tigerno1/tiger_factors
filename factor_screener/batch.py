@@ -14,6 +14,7 @@ import pandas as pd
 from tiger_factors.factor_screener._screener import FactorScreener
 from tiger_factors.factor_screener._screener import FactorScreenerResult
 from tiger_factors.factor_screener._screener import FactorScreenerSpec
+from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_screener.selection import FactorMarginalSelectionConfig
 from tiger_factors.factor_screener.selection import select_factors_by_marginal_gain
 from tiger_factors.factor_screener.selection import select_non_redundant_factors
@@ -233,6 +234,34 @@ class FactorScreenerBatchResult:
     def global_selected_factor_names_list(self) -> list[str]:
         return list(self.global_selected_factor_names)
 
+    @property
+    def selected_factor_specs(self) -> list[FactorSpec]:
+        if self.global_selected_factor_specs:
+            return list(self.global_selected_factor_specs)
+        specs: list[FactorSpec] = []
+        for result in self.results:
+            specs.extend(result.selected_factor_specs)
+        return specs
+
+    @property
+    def global_selected_factor_specs(self) -> list[FactorSpec]:
+        if not self.global_selected_factor_keys:
+            return []
+        specs_by_label: dict[str, FactorScreenerResult] = {}
+        for index, (item, result) in enumerate(zip(self.spec.items, self.results)):
+            label = _item_label(item, index)
+            specs_by_label[label] = result
+        selected_specs: list[FactorSpec] = []
+        for key in self.global_selected_factor_keys:
+            label, factor_name = key.split("::", 1) if "::" in key else ("", key)
+            result = specs_by_label.get(label)
+            if result is None:
+                continue
+            match = next((spec for spec in result.factor_specs if spec.table_name == factor_name), None)
+            if match is not None:
+                selected_specs.append(match)
+        return selected_specs
+
     def spec_summaries(self) -> pd.DataFrame:
         rows: list[dict[str, object]] = []
         for index, (item, result) in enumerate(zip(self.spec.items, self.results)):
@@ -242,13 +271,16 @@ class FactorScreenerBatchResult:
                 {
                     "batch_index": index,
                     "batch_label": label,
+                    "group": result.spec.group,
                     "factor_count": int(len(result.spec.factor_names)),
                     "screened_factor_count": int(len(result.screened_factor_names)),
                     "selected_factor_count": int(len(selected_names)),
                     "missing_return_factor_count": int(len(result.missing_return_factors)),
                     "return_long_rows": int(len(result.return_long)),
                     "return_panel_columns": int(len(result.return_panel.columns)),
-                    "return_modes": list(result.spec.return_modes),
+                    "correlation_method": result.spec.correlation_method,
+                    "ic_correlation_method": result.spec.ic_correlation_method,
+                    "return_modes": sorted({str(key.split(":", 1)[1]) for key in result.return_series if ":" in key}),
                     "selected_factor_names": list(selected_names),
                     "screened_factor_names": list(result.screened_factor_names),
                     "rejected_factor_names": list(result.rejected_factor_names),
@@ -259,9 +291,19 @@ class FactorScreenerBatchResult:
     def to_summary(self) -> dict[str, object]:
         spec_summary = self.spec_summaries()
         selection_mode = _resolve_selection_mode(self.spec.selection_mode)
+        groups = [
+            str(item.spec.group)
+            for item in self.spec.items
+            if getattr(item.spec, "group", None) is not None
+        ]
+        unique_groups = sorted(set(groups))
         return {
             "selection_mode": selection_mode,
+            "group": unique_groups[0] if len(unique_groups) == 1 else None,
+            "groups": unique_groups,
             "return_gain_preset": self.spec.return_gain_preset,
+            "correlation_method": self.spec.items[0].spec.correlation_method if self.spec.items else None,
+            "ic_correlation_method": self.spec.items[0].spec.ic_correlation_method if self.spec.items else None,
             "spec_count": int(len(self.spec.items)),
             "screened_rows": int(len(self.summary)),
             "selection_rows": int(len(self.selection_summary)),
@@ -299,7 +341,10 @@ class FactorScreenerBatchResult:
         preferred_columns = [
             "record_type",
             "selection_mode",
+            "group",
             "return_gain_preset",
+            "correlation_method",
+            "ic_correlation_method",
             "batch_index",
             "batch_label",
             "spec_count",
@@ -490,16 +535,12 @@ def _item_label(item: FactorScreenerBatchItem, index: int) -> str:
 
 
 def _spec_signature(spec: FactorScreenerSpec) -> str:
-    variant = spec.variant or "default"
     return ":".join(
         [
-            str(spec.provider),
-            str(spec.region),
-            str(spec.sec_type),
-            str(spec.freq),
-            str(variant),
-            str(spec.summary_section),
-            str(spec.returns_section),
+            str(spec.selection_threshold),
+            str(spec.selection_score_field),
+            str(spec.correlation_method),
+            str(spec.ic_correlation_method),
         ]
     )
 
@@ -520,6 +561,43 @@ def _tag_frame(
     if "factor_name" in tagged.columns:
         tagged["batch_factor_key"] = tagged["factor_name"].astype(str).map(lambda name: f"{batch_label}::{name}")
     return tagged
+
+
+def _factor_frame_to_panel(frame: pd.DataFrame, *, factor_name: str) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    normalized = frame.copy()
+    if "date_" in normalized.columns:
+        normalized["date_"] = pd.to_datetime(normalized["date_"], errors="coerce")
+    if "code" in normalized.columns:
+        normalized["code"] = normalized["code"].astype(str)
+
+    if {"date_", "code"}.issubset(normalized.columns):
+        value_candidates = [
+            column
+            for column in normalized.columns
+            if column not in {"date_", "code"}
+            and pd.api.types.is_numeric_dtype(normalized[column])
+        ]
+        if not value_candidates:
+            return pd.DataFrame()
+        value_column = "value" if "value" in value_candidates else value_candidates[0]
+        panel = normalized.pivot_table(index="date_", columns="code", values=value_column, aggfunc="last")
+        panel.index = pd.to_datetime(panel.index, errors="coerce")
+        panel = panel.loc[~panel.index.isna()].sort_index()
+        panel.columns = panel.columns.astype(str)
+        panel.columns.name = factor_name
+        return panel
+
+    if isinstance(normalized.index, pd.DatetimeIndex):
+        panel = normalized.copy()
+        panel.index = pd.to_datetime(panel.index, errors="coerce")
+        panel = panel.loc[~panel.index.isna()].sort_index()
+        panel.columns = panel.columns.astype(str)
+        panel.columns.name = factor_name
+        return panel
+
+    return pd.DataFrame()
 
 
 def _score_series(
@@ -545,11 +623,14 @@ def _score_series(
     return values.replace([pd.NA, pd.NaT], pd.NA)
 
 
-def _primary_return_mode(spec: FactorScreenerSpec) -> str:
-    if "long_short" in spec.return_modes:
+def _primary_return_mode(result: FactorScreenerResult) -> str:
+    available_modes = sorted(
+        {str(key.split(":", 1)[1]) for key in result.return_series if ":" in key}
+    )
+    if "long_short" in available_modes:
         return "long_short"
-    if spec.return_modes:
-        return spec.return_modes[0]
+    if "long_only" in available_modes:
+        return "long_only"
     return "long_short"
 
 
@@ -569,19 +650,35 @@ def _extract_primary_return_series(
 
 
 def _combined_return_panel(results: list[tuple[str, FactorScreenerResult]]) -> pd.DataFrame:
+    from collections import Counter
+
+    column_counts: Counter[str] = Counter()
+    for _, result in results:
+        column_counts.update(str(column) for column in result.return_panel.columns)
+
     frames: dict[str, pd.Series] = {}
     for batch_label, result in results:
-        for key, series in result.return_series.items():
-            if series.empty:
-                continue
-            composite_key = f"{batch_label}::{key}"
-            frames[composite_key] = series
+        panel = result.return_panel.copy()
+        if panel.empty:
+            continue
+        for column in panel.columns:
+            name = str(column)
+            composite_key = name if column_counts[name] == 1 else f"{batch_label}::{name}"
+            frames[composite_key] = panel[column]
     if not frames:
         return pd.DataFrame()
     frame = pd.DataFrame(frames).sort_index()
     frame.index = pd.to_datetime(frame.index, errors="coerce")
     frame = frame.loc[~frame.index.isna()].sort_index()
     return frame
+
+
+def _build_result_return_artifacts(
+    label: str,
+    screener: FactorScreener,
+    result: FactorScreenerResult,
+) -> tuple[dict[str, pd.Series], pd.DataFrame, pd.DataFrame, list[str]]:
+    return dict(result.return_series), result.return_long.copy(), result.return_panel.copy(), list(result.missing_return_factors)
 
 
 def _collect_candidate_panels(
@@ -606,16 +703,18 @@ def _collect_candidate_panels(
             continue
 
         factor_names = frame["factor_name"].astype(str).tolist()
-        loaded_panels = screener.library.load_factor_panels(
-            factor_names=factor_names,
-            provider=screener.spec.provider,
-            freq=screener.spec.freq,
-            variant=screener.spec.variant,
-        )
         scores = _score_series(frame, score_field=score_field)
 
-        for factor_name, panel in loaded_panels.items():
-            if not isinstance(panel, pd.DataFrame) or panel.empty:
+        for factor_name in factor_names:
+            factor_spec = next((spec for spec in screener.factor_specs if spec.table_name == factor_name), None)
+            if factor_spec is None:
+                continue
+            raw_frame = screener.store.get_factor(
+                factor_spec,
+                engine="pandas",
+            )
+            panel = _factor_frame_to_panel(raw_frame if isinstance(raw_frame, pd.DataFrame) else pd.DataFrame(), factor_name=factor_name)
+            if panel.empty:
                 continue
             composite_key = f"{label}::{factor_name}"
             candidate_panels[composite_key] = panel
@@ -659,7 +758,7 @@ def _collect_candidate_returns(
         if result is None:
             continue
 
-        primary_mode = _primary_return_mode(screener.spec)
+        primary_mode = _primary_return_mode(result)
         extracted = _extract_primary_return_series(result, primary_mode=primary_mode)
         for factor_name, series in extracted.items():
             batch_key = f"{label}::{factor_name}"
@@ -751,45 +850,64 @@ class FactorScreenerBatch:
         selection_mode = _resolve_selection_mode(self.spec.selection_mode)
         results: list[tuple[str, FactorScreenerResult]] = []
         screeners: list[tuple[str, FactorScreener]] = []
-
-        summary_frames: list[pd.DataFrame] = []
-        selection_frames: list[pd.DataFrame] = []
-        return_long_frames: list[pd.DataFrame] = []
+        return_panel_frames: list[tuple[str, pd.DataFrame]] = []
 
         for index, item in enumerate(items):
             label, screener, result = self._run_item(item, index=index)
-            signature = _spec_signature(item.spec)
             results.append((label, result))
             screeners.append((label, screener))
-            summary_frames.append(
-                _tag_frame(
-                    result.summary,
-                    batch_index=index,
-                    batch_label=label,
-                    batch_signature=signature,
+
+        return_long_frames: list[pd.DataFrame] = []
+        for index, ((label, screener), (_, result)) in enumerate(zip(screeners, results)):
+            _, return_long, return_panel, _ = _build_result_return_artifacts(label, screener, result)
+            if not return_long.empty:
+                return_long_frames.append(
+                    _tag_frame(
+                        return_long,
+                        batch_index=index,
+                        batch_label=label,
+                        batch_signature=_spec_signature(screener.spec),
+                    )
                 )
+            if not return_panel.empty:
+                tagged_panel = return_panel.copy()
+                tagged_panel.index = pd.to_datetime(tagged_panel.index, errors="coerce")
+                tagged_panel = tagged_panel.loc[~tagged_panel.index.isna()].sort_index()
+                return_panel_frames.append((label, tagged_panel))
+
+        summary_frames = [
+            _tag_frame(
+                result.summary,
+                batch_index=index,
+                batch_label=label,
+                batch_signature=_spec_signature(result.spec),
             )
-            selection_frames.append(
-                _tag_frame(
-                    result.selection_summary,
-                    batch_index=index,
-                    batch_label=label,
-                    batch_signature=signature,
-                )
+            for index, (label, result) in enumerate(results)
+        ]
+        selection_frames = [
+            _tag_frame(
+                result.selection_summary,
+                batch_index=index,
+                batch_label=label,
+                batch_signature=_spec_signature(result.spec),
             )
-            return_long_frames.append(
-                _tag_frame(
-                    result.return_long,
-                    batch_index=index,
-                    batch_label=label,
-                    batch_signature=signature,
-                )
-            )
+            for index, (label, result) in enumerate(results)
+        ]
 
         summary = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
         selection_summary = pd.concat(selection_frames, ignore_index=True) if selection_frames else pd.DataFrame()
         return_long = pd.concat(return_long_frames, ignore_index=True) if return_long_frames else pd.DataFrame()
-        return_panel = _combined_return_panel(results)
+        if not return_panel_frames:
+            return_panel = _combined_return_panel(results)
+        elif len(return_panel_frames) == 1:
+            return_panel = return_panel_frames[0][1]
+        else:
+            panels: list[pd.DataFrame] = []
+            for label, panel in return_panel_frames:
+                prefixed = panel.copy()
+                prefixed.columns = [f"{label}::{column}" for column in prefixed.columns]
+                panels.append(prefixed)
+            return_panel = pd.concat(panels, axis=1).sort_index()
 
         global_selected_keys: tuple[str, ...] = ()
         global_selected_names: tuple[str, ...] = ()

@@ -5,6 +5,7 @@ import pandas as pd
 
 from tiger_factors.factor_evaluation.evaluation import SingleFactorEvaluation
 from tiger_factors.factor_store import FactorSpec
+from tiger_factors.factor_store import EvaluationStore
 import tiger_factors.factor_store.evaluation_store as evaluation_store_module
 
 
@@ -73,6 +74,29 @@ def test_single_factor_evaluation_open_and_summary_accessor(tmp_path, monkeypatc
     loaded = evaluation.summary().get_table()
 
     assert loaded.equals(expected)
+
+
+def test_evaluation_store_uses_factor_group_directory(tmp_path, monkeypatch) -> None:
+    _use_temp_evaluation_root(monkeypatch, tmp_path)
+    store = EvaluationStore(tmp_path)
+    spec = FactorSpec(
+        provider="tiger",
+        region="us",
+        sec_type="stock",
+        freq="1d",
+        table_name="alpha_test",
+        group="core",
+    )
+    summary = pd.DataFrame([{"ic_mean": 1.23, "sharpe": 4.56}])
+
+    result = store.save_evaluation(summary, spec=spec, force_updated=True)
+    expected_root = tmp_path / "evaluation" / "tiger" / "us" / "stock" / "1d" / "core" / "alpha_test"
+
+    assert result.run_dir == expected_root
+    assert (expected_root / "summary" / "summary.parquet").exists()
+    assert (expected_root / "manifest.json").exists()
+    loaded = store.section(spec, "summary").get_table()
+    assert loaded.equals(summary)
 
 
 def test_single_factor_evaluation_extensions(tmp_path, monkeypatch) -> None:

@@ -104,14 +104,17 @@ class FactorEvaluationEngine:
 
     def _default_report_root(self) -> Path:
         if self.spec is not None:
-            return report_output_root_for(
+            parts = [
                 "factor_evaluation",
                 self.spec.provider.lower(),
                 self.spec.region.lower(),
                 self.spec.sec_type.lower(),
                 self.spec.freq.lower(),
-                self.spec.data_stem(),
-            )
+            ]
+            if getattr(self.spec, "group", None) is not None:
+                parts.append(str(self.spec.group))
+            parts.append(self.spec.data_stem())
+            return report_output_root_for(*parts)
         return report_output_root_for("factor_evaluation", self.factor_column or "factor")
 
     def _resolve_report_section_dir(self, name: str, output_dir: str | Path | None) -> Path:

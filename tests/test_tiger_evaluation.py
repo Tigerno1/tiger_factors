@@ -210,6 +210,7 @@ def test_tiger_factor_evaluation_uses_spec_for_default_root(tmp_path, monkeypatc
         table_name="alpha_001",
         variant=None,
         provider="simfin",
+        group="core",
     )
     engine = FactorEvaluationEngine(
         factor_frame=factor,
@@ -224,6 +225,7 @@ def test_tiger_factor_evaluation_uses_spec_for_default_root(tmp_path, monkeypatc
         "us",
         "stock",
         "1d",
+        "core",
         "alpha_001",
     )
 

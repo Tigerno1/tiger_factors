@@ -6,12 +6,18 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from tiger_factors.factor_evaluation.engine import FactorEvaluationEngine
-from tiger_factors.factor_screener import FactorMetricFilterConfig
-from tiger_factors.factor_screener import screen_factor_metrics
+from tiger_factors.factor_evaluation.performance import factor_returns
+from tiger_factors.factor_evaluation.performance import mean_return_by_quantile
+from tiger_factors.factor_evaluation.utils import get_clean_factor_and_forward_returns as tiger_clean_factor_and_forward_returns
+from tiger_factors.factor_evaluation.utils import period_to_label
 from tiger_factors.factor_store import TigerFactorLibrary
+from tiger_factors.multifactor_evaluation._inputs import coerce_factor_series
+from tiger_factors.multifactor_evaluation.screening import FactorMetricFilterConfig
+from tiger_factors.multifactor_evaluation.screening import screen_factor_metrics
 
 
 FACTOR_FILE_PATTERN = re.compile(r"^\d+_.+\.parquet$")
@@ -24,6 +30,134 @@ class FactorScreeningRunResult:
     screened_path: str
     factor_count: int
     screened_count: int
+
+
+def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Series:
+    cleaned = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if cleaned.empty:
+        return cleaned
+    cleaned.index = pd.to_datetime(cleaned.index, errors="coerce")
+    cleaned = cleaned[~cleaned.index.isna()].sort_index()
+    cleaned.name = factor_name
+    return cleaned
+
+
+def _top_quantile_series_from_mean_returns(
+    factor_data: pd.DataFrame,
+    *,
+    selected_period: str | int | pd.Timedelta,
+) -> pd.Series | None:
+    mean_ret, _ = mean_return_by_quantile(
+        factor_data,
+        by_date=True,
+        by_group=False,
+        demeaned=False,
+    )
+    period_label = period_to_label(selected_period)
+    if period_label not in mean_ret.columns:
+        return None
+    frame = mean_ret[period_label].unstack("factor_quantile").sort_index()
+    if frame.empty:
+        return None
+    quantile_cols = pd.Index(frame.columns)
+    if quantile_cols.empty:
+        return None
+    top_quantile = pd.to_numeric(quantile_cols, errors="coerce").max()
+    if pd.isna(top_quantile):
+        top_quantile = quantile_cols[-1]
+    series = pd.to_numeric(frame[top_quantile], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    series.index = pd.to_datetime(series.index, errors="coerce")
+    series = series[~series.index.isna()].sort_index()
+    series.name = "long_only"
+    return series
+
+
+def _resolve_return_period(preferred_period: str | int | pd.Timedelta | None) -> str | int | pd.Timedelta:
+    if preferred_period is not None:
+        return preferred_period
+    return 1
+
+
+def _config_value(config: object | None, name: str, default: object) -> object:
+    if config is None:
+        return default
+    return getattr(config, name, default)
+
+
+def build_single_factor_return_long_frame(
+    factor: pd.Series | pd.DataFrame,
+    prices: pd.DataFrame,
+    *,
+    factor_name: str | None = None,
+    return_modes: tuple[str, ...] = ("long_short", "long_only"),
+    preferred_return_period: str | int | pd.Timedelta | None = None,
+    long_short_config: object | None = None,
+) -> pd.DataFrame:
+    """Convert one factor into ``date_ / factor / return / return_mode`` rows."""
+    name = str(factor_name).strip() if factor_name is not None else getattr(factor, "name", None) or "factor"
+    selected_period = _resolve_return_period(preferred_return_period)
+    modes = tuple(str(mode).strip().lower() for mode in return_modes if str(mode).strip())
+    if not modes:
+        return pd.DataFrame(columns=["date_", "factor", "return", "return_mode"])
+
+    factor_series = coerce_factor_series(factor)
+    prepared = tiger_clean_factor_and_forward_returns(
+        factor=factor_series,
+        prices=prices,
+        quantiles=int(_config_value(long_short_config, "quantiles", 5)),
+        periods=(selected_period,),
+        filter_zscore=_config_value(long_short_config, "filter_zscore", 20),
+        max_loss=_config_value(long_short_config, "max_loss", 0.35),
+        cumulative_returns=bool(_config_value(long_short_config, "cumulative_returns", True)),
+    )
+    factor_data = prepared.factor_data
+
+    frames: list[pd.DataFrame] = []
+    if "long_short" in modes:
+        series = factor_returns(
+            factor_data,
+            demeaned=bool(_config_value(long_short_config, "long_short", True)),
+            group_adjust=bool(_config_value(long_short_config, "group_neutral", False)),
+            equal_weight=bool(_config_value(long_short_config, "equal_weight", False)),
+        )
+        period_label = period_to_label(selected_period)
+        if period_label in series.columns:
+            long_short_series = _normalize_return_series(series[period_label], factor_name=name)
+            if not long_short_series.empty:
+                frames.append(
+                    pd.DataFrame(
+                        {
+                            "date_": pd.to_datetime(pd.Index(long_short_series.index), errors="coerce").to_numpy(),
+                            "factor": name,
+                            "return": pd.to_numeric(long_short_series, errors="coerce").to_numpy(),
+                            "return_mode": "long_short",
+                        }
+                    ).dropna(subset=["date_", "return"])[["date_", "factor", "return", "return_mode"]]
+                )
+
+    if "long_only" in modes:
+        long_only = _top_quantile_series_from_mean_returns(factor_data, selected_period=selected_period)
+        if long_only is not None and not long_only.empty:
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "date_": pd.to_datetime(pd.Index(long_only.index), errors="coerce").to_numpy(),
+                        "factor": name,
+                        "return": pd.to_numeric(long_only, errors="coerce").to_numpy(),
+                        "return_mode": "long_only",
+                    }
+                ).dropna(subset=["date_", "return"])[["date_", "factor", "return", "return_mode"]]
+            )
+
+    if not frames:
+        return pd.DataFrame(columns=["date_", "factor", "return", "return_mode"])
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .dropna(subset=["date_", "factor", "return"])
+        .sort_values(["date_", "factor", "return_mode"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 def _discover_factor_files(root: Path) -> list[Path]:
@@ -224,5 +358,6 @@ def evaluate_and_screen_factor_root(
 __all__ = [
     "FACTOR_FILE_PATTERN",
     "FactorScreeningRunResult",
+    "build_single_factor_return_long_frame",
     "evaluate_and_screen_factor_root",
 ]

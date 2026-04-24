@@ -47,6 +47,97 @@ def greedy_select_by_correlation(
     return selected
 
 
+def _select_from_correlation_matrix(
+    corr: pd.DataFrame,
+    scores: dict[str, float],
+    *,
+    threshold: float,
+    comparator: str = "max",
+) -> list[str]:
+    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    selected: list[str] = []
+
+    for name, _ in ordered:
+        if name not in corr.index or name not in corr.columns:
+            continue
+        if not selected:
+            selected.append(name)
+            continue
+
+        selected_values = [abs(float(corr.loc[name, picked])) for picked in selected if picked in corr.columns]
+        selected_values = [value for value in selected_values if pd.notna(value)]
+        if not selected_values:
+            selected.append(name)
+            continue
+
+        if comparator == "max":
+            measure = max(selected_values)
+        elif comparator == "mean":
+            measure = float(np.mean(selected_values))
+        elif comparator == "sum":
+            measure = float(np.sum(selected_values))
+        else:
+            raise ValueError(f"unknown comparator: {comparator!r}")
+
+        if measure < threshold:
+            selected.append(name)
+
+    return selected
+
+
+def select_by_average_correlation(
+    factors: dict[str, pd.Series | pd.DataFrame],
+    scores: dict[str, float],
+    *,
+    threshold: float = 0.75,
+    standardize: bool = True,
+) -> list[str]:
+    corr = factor_correlation_matrix(factors)
+    return _select_from_correlation_matrix(corr, scores, threshold=threshold, comparator="mean")
+
+
+def select_by_graph_independent_set(
+    factors: dict[str, pd.Series | pd.DataFrame],
+    scores: dict[str, float],
+    *,
+    threshold: float = 0.75,
+    standardize: bool = True,
+) -> list[str]:
+    corr = factor_correlation_matrix(factors)
+    return select_by_graph_independent_set_from_correlation_matrix(corr, scores, threshold=threshold)
+
+
+def select_by_graph_independent_set_from_correlation_matrix(
+    corr: pd.DataFrame,
+    scores: dict[str, float],
+    *,
+    threshold: float = 0.75,
+) -> list[str]:
+    if corr.empty:
+        return []
+    degree: dict[str, int] = {}
+    for name in corr.index:
+        row = corr.loc[name].dropna().abs()
+        degree[str(name)] = int((row >= threshold).sum() - 1)
+
+    remaining = {str(name) for name in corr.index}
+    selected: list[str] = []
+    while remaining:
+        def node_key(name: str) -> tuple[float, float, str]:
+            score = float(scores.get(name, 0.0))
+            penalty = float(degree.get(name, 0))
+            return (score / (1.0 + penalty), score, name)
+
+        best = max(remaining, key=node_key)
+        selected.append(best)
+        neighbors = set()
+        if best in corr.index:
+            row = corr.loc[best].dropna().abs()
+            neighbors = {str(name) for name, value in row.items() if name in remaining and float(value) >= threshold}
+        remaining.difference_update(neighbors | {best})
+    return selected
+
+
 def select_non_redundant_factors(
     factors: dict[str, pd.Series | pd.DataFrame],
     scores: dict[str, float],
@@ -54,8 +145,49 @@ def select_non_redundant_factors(
     threshold: float = 0.75,
     standardize: bool = True,
 ) -> list[str]:
-    corr = factor_correlation_matrix(factors, standardize=standardize)
+    corr = factor_correlation_matrix(factors)
     return greedy_select_by_correlation(scores, corr, threshold=threshold)
+
+
+def select_cluster_representatives(
+    factors: dict[str, pd.Series | pd.DataFrame],
+    scores: dict[str, float],
+    *,
+    threshold: float = 0.75,
+    standardize: bool = True,
+) -> list[str]:
+    corr = factor_correlation_matrix(factors)
+    return select_cluster_representatives_from_correlation_matrix(corr, scores, threshold=threshold)
+
+
+def select_cluster_representatives_from_correlation_matrix(
+    corr: pd.DataFrame,
+    scores: dict[str, float],
+    *,
+    threshold: float = 0.75,
+) -> list[str]:
+    clusters = cluster_factors(corr, threshold=threshold)
+    if not clusters:
+        return []
+
+    cluster_members: dict[int, list[str]] = {}
+    for name, cluster_id in clusters.items():
+        cluster_members.setdefault(int(cluster_id), []).append(str(name))
+
+    cluster_order: list[tuple[float, int]] = []
+    for cluster_id, members in cluster_members.items():
+        cluster_score = max(float(scores.get(member, 0.0)) for member in members) if members else 0.0
+        cluster_order.append((cluster_score, cluster_id))
+    cluster_order.sort(reverse=True)
+
+    selected: list[str] = []
+    for _, cluster_id in cluster_order:
+        members = cluster_members.get(cluster_id, [])
+        if not members:
+            continue
+        best_member = max(members, key=lambda name: float(scores.get(name, 0.0)))
+        selected.append(best_member)
+    return selected
 
 
 def select_ic_coherent_factors(
@@ -71,6 +203,36 @@ def select_ic_coherent_factors(
     if scores is None:
         scores = {name: float(np.nan_to_num(ic_corr.loc[name].abs().mean(), nan=0.0)) for name in ic_corr.columns}
     return greedy_select_by_correlation(scores, ic_corr, threshold=threshold)
+
+
+def select_ic_by_average_correlation(
+    factors: dict[str, pd.Series | pd.DataFrame],
+    prices: pd.DataFrame,
+    *,
+    horizon: int = 1,
+    min_names: int | None = 10,
+    threshold: float = 0.75,
+    scores: dict[str, float] | None = None,
+) -> list[str]:
+    ic_corr = ic_correlation_matrix(factors, coerce_price_panel(prices), horizon=horizon, min_names=min_names)
+    if scores is None:
+        scores = {name: float(np.nan_to_num(ic_corr.loc[name].abs().mean(), nan=0.0)) for name in ic_corr.columns}
+    return _select_from_correlation_matrix(ic_corr, scores, threshold=threshold, comparator="mean")
+
+
+def select_ic_by_graph_independent_set(
+    factors: dict[str, pd.Series | pd.DataFrame],
+    prices: pd.DataFrame,
+    *,
+    horizon: int = 1,
+    min_names: int | None = 10,
+    threshold: float = 0.75,
+    scores: dict[str, float] | None = None,
+) -> list[str]:
+    ic_corr = ic_correlation_matrix(factors, coerce_price_panel(prices), horizon=horizon, min_names=min_names)
+    if scores is None:
+        scores = {name: float(np.nan_to_num(ic_corr.loc[name].abs().mean(), nan=0.0)) for name in ic_corr.columns}
+    return select_by_graph_independent_set_from_correlation_matrix(ic_corr, scores, threshold=threshold)
 
 
 def _weighted_metric_score(
@@ -175,7 +337,7 @@ def select_factors_by_marginal_gain(
     scores.index = metric_frame[key_column].astype(str)
     penalties.index = metric_frame[key_column].astype(str)
 
-    corr = factor_correlation_matrix(factors, standardize=cfg.standardize)
+    corr = factor_correlation_matrix(factors)
     ordered = scores.sort_values(ascending=False).index.astype(str).tolist()
 
     selected: list[str] = []
@@ -210,7 +372,14 @@ __all__ = [
     "greedy_select_by_correlation",
     "ic_correlation_matrix",
     "ic_time_series",
+    "select_by_average_correlation",
+    "select_by_graph_independent_set",
+    "select_by_graph_independent_set_from_correlation_matrix",
+    "select_cluster_representatives",
+    "select_cluster_representatives_from_correlation_matrix",
     "select_factors_by_marginal_gain",
     "select_ic_coherent_factors",
+    "select_ic_by_average_correlation",
+    "select_ic_by_graph_independent_set",
     "select_non_redundant_factors",
 ]

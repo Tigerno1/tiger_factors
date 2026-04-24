@@ -5,6 +5,9 @@ from tiger_factors.multifactor_evaluation.reporting.portfolio import PortfolioTe
 from tiger_factors.multifactor_evaluation.reporting.portfolio import create_portfolio_tear_sheet
 from tiger_factors.multifactor_evaluation.reporting.positions import PositionReportResult
 from tiger_factors.multifactor_evaluation.reporting.positions import create_position_tear_sheet
+from tiger_factors.multifactor_evaluation.reporting.analysis_report import MultifactorAnalysisReportResult
+from tiger_factors.multifactor_evaluation.reporting.analysis_report import create_analysis_report
+from tiger_factors.multifactor_evaluation.reporting.analysis_report import MultifactorAnalysisReportSpec
 from tiger_factors.multifactor_evaluation.reporting.summary_table import FactorSummaryTableConfig
 from tiger_factors.multifactor_evaluation.reporting.summary_table import build_factor_summary_table
 from tiger_factors.multifactor_evaluation.reporting.summary import MultifactorSummaryReportResult
@@ -17,10 +20,13 @@ __all__ = [
     "PortfolioTearSheetResult",
     "PositionReportResult",
     "PortfolioTradeAnalysisResult",
+    "MultifactorAnalysisReportResult",
+    "MultifactorAnalysisReportSpec",
     "MultifactorSummaryReportResult",
     "build_penetration_analysis",
     "build_selected_factor_evaluations",
     "build_factor_summary_table",
+    "create_analysis_report",
     "create_portfolio_tear_sheet",
     "create_position_tear_sheet",
     "create_summary_tear_sheet",

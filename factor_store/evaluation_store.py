@@ -70,7 +70,16 @@ def _returns_img_sort_key(stem: str) -> tuple[int, int, str]:
 
 
 def _evaluation_dataset_dir(spec: FactorSpec, root: str | Path) -> Path:
-    return Path(root) / "evaluation" / spec.provider / spec.region / spec.sec_type / spec.freq / spec.data_stem()
+    parts = [
+        "evaluation",
+        spec.provider,
+        spec.region,
+        spec.sec_type,
+        spec.freq,
+    ]
+    if getattr(spec, "group", None) is not None:
+        parts.append(str(spec.group))
+    return Path(root).joinpath(*parts, spec.data_stem())
 
 
 @dataclass(frozen=True, slots=True)

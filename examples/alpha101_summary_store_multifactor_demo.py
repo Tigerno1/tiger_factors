@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import asdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +43,6 @@ from tiger_factors.factor_store import AdjPriceSpec
 from tiger_factors.factor_store import FactorStore
 from tiger_factors.factor_store import TigerFactorLibrary
 from tiger_factors.multifactor_evaluation import MultifactorEvaluation
-from tiger_factors.factor_screener import FactorMetricFilterConfig
 from tiger_factors.factor_screener import factor_correlation_matrix
 from tiger_factors.factor_screener import screen_factor_registry
 from tiger_factors.multifactor_evaluation.backtest import multi_factor_backtest
@@ -66,34 +67,35 @@ DEFAULT_TRANSACTION_COST_BPS = 8.0
 DEFAULT_SLIPPAGE_BPS = 4.0
 DEFAULT_REPORT_NAME = "alpha101_summary_store_multifactor"
 
-STORE_ROOT = DEFAULT_STORE_ROOT
-SUMMARY_REGISTRY = DEFAULT_SUMMARY_REGISTRY
-OUTPUT_DIR = DEFAULT_OUTPUT_DIR
-PROVIDER = DEFAULT_PROVIDER
-REGION = DEFAULT_REGION
-SEC_TYPE = DEFAULT_SEC_TYPE
-FREQ = DEFAULT_FREQ
-PRICE_PROVIDER = DEFAULT_PRICE_PROVIDER
-VARIANT = None
-FACTOR_PREFIX = "alpha_"
-FACTOR_NAMES: list[str] | None = None
-START = None
-END = None
-TOP_N_INITIAL = DEFAULT_TOP_N_INITIAL
-CORR_THRESHOLD = DEFAULT_CORR_THRESHOLD
-LONG_PCT = DEFAULT_LONG_PCT
-REBALANCE_FREQ = DEFAULT_REBALANCE_FREQ
-WEIGHT_METHOD = DEFAULT_WEIGHT_METHOD
-WEIGHT_TEMPERATURE = DEFAULT_WEIGHT_TEMPERATURE
-SCORE_FIELD = "fitness"
-MIN_FITNESS = 0.0
-MIN_IC_MEAN = 0.0
-MIN_RANK_IC_MEAN = 0.0
-MIN_SHARPE = 0.0
-MAX_TURNOVER = 0.70
-TRANSACTION_COST_BPS = DEFAULT_TRANSACTION_COST_BPS
-SLIPPAGE_BPS = DEFAULT_SLIPPAGE_BPS
-OPEN_BROWSER = False
+
+@dataclass(frozen=True)
+class WorkflowConfig:
+    store_root: Path = DEFAULT_STORE_ROOT
+    summary_registry: Path = DEFAULT_SUMMARY_REGISTRY
+    output_dir: Path = DEFAULT_OUTPUT_DIR
+    provider: str = DEFAULT_PROVIDER
+    region: str = DEFAULT_REGION
+    sec_type: str = DEFAULT_SEC_TYPE
+    freq: str = DEFAULT_FREQ
+    price_provider: str = DEFAULT_PRICE_PROVIDER
+    variant: str | None = None
+    factor_prefix: str = "alpha_"
+    factor_names: list[str] | None = None
+    start: str | None = None
+    end: str | None = None
+    top_n_initial: int = DEFAULT_TOP_N_INITIAL
+    corr_threshold: float = DEFAULT_CORR_THRESHOLD
+    long_pct: float = DEFAULT_LONG_PCT
+    rebalance_freq: str = DEFAULT_REBALANCE_FREQ
+    weight_method: str = DEFAULT_WEIGHT_METHOD
+    weight_temperature: float = DEFAULT_WEIGHT_TEMPERATURE
+    transaction_cost_bps: float = DEFAULT_TRANSACTION_COST_BPS
+    slippage_bps: float = DEFAULT_SLIPPAGE_BPS
+    report_name: str = DEFAULT_REPORT_NAME
+    open_browser: bool = False
+
+
+CONFIG = WorkflowConfig()
 
 
 def _normalize_variant(value: str | None) -> str | None:
@@ -247,9 +249,10 @@ def _serializable_stats(stats: dict[str, object]) -> dict[str, object]:
 
 
 def main() -> None:
-    store_root = Path(STORE_ROOT)
-    summary_registry_path = Path(SUMMARY_REGISTRY)
-    output_dir = Path(OUTPUT_DIR)
+    cfg = CONFIG
+    store_root = Path(cfg.store_root)
+    summary_registry_path = Path(cfg.summary_registry)
+    output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # registry = _load_summary_registry(summary_registry_path)
@@ -257,20 +260,11 @@ def main() -> None:
     print(registry)
     alpha_registry = _select_alpha_rows(
         registry,
-        factor_prefix=FACTOR_PREFIX,
-        factor_names=FACTOR_NAMES,
+        factor_prefix=cfg.factor_prefix,
+        factor_names=cfg.factor_names,
     )
 
-    screen_config = FactorMetricFilterConfig(
-        min_fitness=MIN_FITNESS,
-        min_ic_mean=MIN_IC_MEAN,
-        min_rank_ic_mean=MIN_RANK_IC_MEAN,
-        min_sharpe=MIN_SHARPE,
-        max_turnover=MAX_TURNOVER,
-        sort_field=SCORE_FIELD,
-        tie_breaker_field="ic_ir",
-    )
-    screened = screen_factor_registry(alpha_registry, config=screen_config)
+    screened = screen_factor_registry(alpha_registry)
 #     usable = screened.loc[screened["usable"]].copy()
 #     if usable.empty:
 #         raise RuntimeError("No Alpha101 factors passed the summary-based screening rules.")
@@ -279,14 +273,14 @@ def main() -> None:
 #     candidate_names = candidate_frame["factor_name"].astype(str).tolist()
 
 #     factor_store = FactorStore(root_dir=store_root)
-#     library = TigerFactorLibrary(output_dir=store_root, price_provider=PRICE_PROVIDER, verbose=True)
+#     library = TigerFactorLibrary(output_dir=store_root, price_provider=cfg.price_provider, verbose=True)
 #     factor_panels = library.load_factor_panels(
 #         factor_names=candidate_names,
-#         provider=PROVIDER,
-#         freq=FREQ,
-#         variant=_normalize_variant(VARIANT),
-#         start=START,
-#         end=END,
+#         provider=cfg.provider,
+#         freq=cfg.freq,
+#         variant=cfg.variant,
+#         start=cfg.start,
+#         end=cfg.end,
 #     )
 #     if not factor_panels:
 #         raise RuntimeError("No factor panels could be loaded from the factor store for the screened Alpha101 factors.")
@@ -306,7 +300,7 @@ def main() -> None:
 
 #     corr_matrix = factor_correlation_matrix(directed_panels)
 #     ranked_names = candidate_frame["factor_name"].astype(str).tolist()
-#     selected_names = _greedy_low_corr_selection(ranked_names, corr_matrix, threshold=float(CORR_THRESHOLD))
+#     selected_names = _greedy_low_corr_selection(ranked_names, corr_matrix, threshold=float(cfg.corr_threshold))
 #     if not selected_names:
 #         raise RuntimeError("Correlation filtering removed every candidate factor.")
 
@@ -337,12 +331,12 @@ def main() -> None:
 #         close_panel,
 #         weights=weights.to_dict(),
 #         standardize=True,
-#         rebalance_freq=REBALANCE_FREQ,
-#         long_pct=float(LONG_PCT),
+#         rebalance_freq=cfg.rebalance_freq,
+#         long_pct=float(cfg.long_pct),
 #         long_short=True,
 #         annual_trading_days=252,
-#         transaction_cost_bps=float(TRANSACTION_COST_BPS),
-#         slippage_bps=float(SLIPPAGE_BPS),
+#         transaction_cost_bps=float(cfg.transaction_cost_bps),
+#         slippage_bps=float(cfg.slippage_bps),
 #     )
 
 #     factor_data: dict[str, pd.DataFrame] = dict(selected_panels)
@@ -354,14 +348,14 @@ def main() -> None:
 #         close_panel_frame=close_panel,
 #         factor_data=factor_data,
 #         output_dir=output_dir,
-#         report_name=DEFAULT_REPORT_NAME,
+#         report_name=cfg.report_name,
 #         capital_base=1_000_000.0,
 #     )
 #     bundle = evaluation.full(
 #         backtest,
 #         output_dir=output_dir,
-#         report_name=DEFAULT_REPORT_NAME,
-#         open_browser=bool(OPEN_BROWSER),
+#         report_name=cfg.report_name,
+#         open_browser=bool(cfg.open_browser),
 #     )
 
 #     selected_summary = selected_frame.copy()
@@ -378,29 +372,29 @@ def main() -> None:
 #     pd.DataFrame(backtest_result["stats"]).T.to_parquet(output_dir / "alpha101_multifactor_backtest_stats.parquet")
 
 #     manifest = {
+#         "config": asdict(cfg),
 #         "store_root": str(store_root),
 #         "summary_registry": str(summary_registry_path),
-#         "provider": PROVIDER,
-#         "freq": FREQ,
-#         "price_provider": PRICE_PROVIDER,
-#         "variant": _normalize_variant(VARIANT),
-#         "factor_prefix": FACTOR_PREFIX,
+#         "provider": cfg.provider,
+#         "freq": cfg.freq,
+#         "price_provider": cfg.price_provider,
+#         "variant": cfg.variant,
+#         "factor_prefix": cfg.factor_prefix,
 #         "candidate_count": int(len(alpha_registry)),
 #         "screened_usable_count": int(len(usable)),
 #         "candidate_names": candidate_names,
 #         "selected_factors": selected_names,
 #         "factor_directions": factor_directions,
 #         "factor_weights": {name: float(weights.loc[name]) for name in selected_names},
-#         "score_field": SCORE_FIELD,
-#         "weight_method": WEIGHT_METHOD,
-#         "weight_temperature": float(WEIGHT_TEMPERATURE),
-#         "corr_threshold": float(CORR_THRESHOLD),
+#         "weight_method": cfg.weight_method,
+#         "weight_temperature": float(cfg.weight_temperature),
+#         "corr_threshold": float(cfg.corr_threshold),
 #         "start": start,
 #         "end": end,
-#         "long_pct": float(LONG_PCT),
-#         "rebalance_freq": REBALANCE_FREQ,
-#         "transaction_cost_bps": float(TRANSACTION_COST_BPS),
-#         "slippage_bps": float(SLIPPAGE_BPS),
+#         "long_pct": float(cfg.long_pct),
+#         "rebalance_freq": cfg.rebalance_freq,
+#         "transaction_cost_bps": float(cfg.transaction_cost_bps),
+#         "slippage_bps": float(cfg.slippage_bps),
 #         "output_dir": str(output_dir),
 #         "report_path": None if bundle.report_path is None else str(bundle.report_path),
 #         "portfolio_stats": _serializable_stats(backtest_result["stats"]["portfolio"]),
