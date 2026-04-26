@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 from typing import Iterable
 
@@ -42,6 +43,9 @@ class RiskfolioConfig:
     method_cov: str = "hist"
     max_kelly: bool = False
     weight_bounds: tuple[float, float] | None = (0.0, 1.0)
+    portfolio_kwargs: dict[str, Any] = field(default_factory=dict)
+    assets_stats_kwargs: dict[str, Any] = field(default_factory=dict)
+    optimization_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 def _resolve_period(config: LongShortReturnConfig) -> int | str | pd.Timedelta:
@@ -148,14 +152,18 @@ def optimize_factor_weights_with_riskfolio(
         raise ValueError("factor_return_panel is empty")
 
     rp = _import_riskfolio()
-    portfolio = rp.Portfolio(returns=returns)
+    portfolio = rp.Portfolio(returns=returns, **cfg.portfolio_kwargs)
 
     if cfg.weight_bounds is not None:
         portfolio.lowerret = None
         portfolio.upperlng = float(cfg.weight_bounds[1])
         portfolio.uppersht = 0.0
 
-    portfolio.assets_stats(method_mu=cfg.method_mu, method_cov=cfg.method_cov)
+    portfolio.assets_stats(
+        method_mu=cfg.method_mu,
+        method_cov=cfg.method_cov,
+        **cfg.assets_stats_kwargs,
+    )
     weights = portfolio.optimization(
         model=cfg.model,
         rm=cfg.rm,
@@ -163,6 +171,7 @@ def optimize_factor_weights_with_riskfolio(
         rf=cfg.rf,
         l=cfg.l,
         hist=cfg.hist,
+        **cfg.optimization_kwargs,
     )
     if weights is None or len(weights) == 0:
         raise RuntimeError("riskfolio optimization returned empty weights")

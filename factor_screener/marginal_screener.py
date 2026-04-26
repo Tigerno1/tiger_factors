@@ -6,6 +6,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from tiger_factors.factor_screener._evaluation_io import load_return_series
+from tiger_factors.factor_screener._evaluation_io import load_summary_row
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
 from tiger_factors.factor_screener.selection import _penalty_score
@@ -16,67 +18,6 @@ from tiger_factors.utils.returns_analysis import annualized_volatility_value
 from tiger_factors.utils.returns_analysis import max_drawdown
 from tiger_factors.utils.returns_analysis import sharpe_ratio
 from tiger_factors.utils.returns_analysis import win_rate
-
-
-def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Series:
-    cleaned = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    if cleaned.empty:
-        return cleaned
-    cleaned.index = pd.to_datetime(cleaned.index, errors="coerce")
-    cleaned = cleaned[~cleaned.index.isna()].sort_index()
-    cleaned.name = factor_name
-    return cleaned
-
-
-def _pick_return_column(frame: pd.DataFrame) -> str:
-    lookup = {str(column): column for column in frame.columns}
-    for candidate in ("long_short", "long_short_returns", "factor_portfolio_returns", "returns", "return", "1D"):
-        if candidate in lookup:
-            return str(lookup[candidate])
-    numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
-    if numeric_columns:
-        return str(numeric_columns[0])
-    raise KeyError(f"could not infer return column from: {list(frame.columns)!r}")
-
-
-def _load_summary_row(store: FactorStore, spec: FactorSpec) -> dict[str, Any] | None:
-    try:
-        frame = store.evaluation.summary(spec).get_table()
-    except FileNotFoundError:
-        return None
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return None
-    working = frame.copy().reset_index(drop=True)
-    if "factor_name" not in working.columns:
-        working.insert(0, "factor_name", spec.table_name)
-    row = working.iloc[0].to_dict()
-    row["factor_name"] = str(row.get("factor_name", spec.table_name))
-    return row
-
-
-def _load_return_series(store: FactorStore, spec: FactorSpec) -> pd.Series | None:
-    try:
-        frame = store.evaluation.returns(spec).get_table("factor_portfolio_returns")
-    except FileNotFoundError:
-        return None
-    if isinstance(frame, pd.Series):
-        return _normalize_return_series(frame, factor_name=spec.table_name)
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return None
-    working = frame.copy()
-    if "date_" in working.columns:
-        working["date_"] = pd.to_datetime(working["date_"], errors="coerce")
-        working = working.loc[working["date_"].notna()]
-        numeric_columns = [column for column in working.columns if column != "date_" and pd.api.types.is_numeric_dtype(working[column])]
-        if numeric_columns:
-            column = _pick_return_column(working[numeric_columns])
-            series = pd.Series(pd.to_numeric(working[column], errors="coerce").to_numpy(), index=working["date_"], name=spec.table_name)
-            return _normalize_return_series(series, factor_name=spec.table_name)
-    column = _pick_return_column(working)
-    series = working[column]
-    if isinstance(series, pd.DataFrame):
-        series = series.squeeze(axis=1)
-    return _normalize_return_series(series, factor_name=spec.table_name)
 
 
 def _summary_metrics_frame(summary_rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -284,10 +225,10 @@ class MarginalScreener:
         return_series_map: dict[str, pd.Series] = {}
         missing_return_factors: list[str] = []
         for spec in self.factor_specs:
-            row = _load_summary_row(self.store, spec)
+            row = load_summary_row(self.store, spec)
             if row is not None:
                 summary_rows.append(row)
-            series = _load_return_series(self.store, spec)
+            series = load_return_series(self.store, spec)
             if series is None or series.empty:
                 missing_return_factors.append(spec.table_name)
                 continue

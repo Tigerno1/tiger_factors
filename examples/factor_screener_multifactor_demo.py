@@ -17,7 +17,6 @@ import json
 import os
 import sys
 from dataclasses import asdict
-from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -37,7 +36,9 @@ from tiger_factors.factor_store import FactorStore
 from tiger_factors.factor_screener import FactorMetricFilterConfig
 from tiger_factors.factor_screener import CorrelationScreenerSpec
 from tiger_factors.factor_screener import FactorScreenerSpec
+from tiger_factors.factor_screener import ScreeningEffectivenessSpec
 from tiger_factors.factor_screener import Screener
+from tiger_factors.factor_allocation import RiskfolioConfig
 from tiger_factors.factor_allocation import allocate_from_return_panel
 from tiger_factors.factor_backtest import run_return_backtest
 from tiger_factors.multifactor_evaluation.reporting.analysis_report import create_analysis_report
@@ -54,45 +55,6 @@ DEFAULT_FACTOR_NAMES = (
     "alpha_066",
     "alpha_092",
 )
-
-@dataclass(frozen=True)
-class SingleFactorScreeningConfig:
-    min_fitness: float | None = 0.10
-    min_ic_mean: float | None = 0.01
-    min_rank_ic_mean: float | None = 0.01
-    min_sharpe: float | None = 0.40
-    max_turnover: float | None = 0.50
-    min_decay_score: float | None = 0.20
-    min_capacity_score: float | None = 0.20
-    max_correlation_penalty: float | None = 0.60
-    min_regime_robustness: float | None = 0.60
-    min_out_of_sample_stability: float | None = 0.60
-    sort_field: str = "fitness"
-    tie_breaker_field: str = "ic_ir"
-
-    def metric_filter_config(self) -> FactorMetricFilterConfig:
-        return FactorMetricFilterConfig(
-            min_fitness=self.min_fitness,
-            min_ic_mean=self.min_ic_mean,
-            min_rank_ic_mean=self.min_rank_ic_mean,
-            min_sharpe=self.min_sharpe,
-            max_turnover=self.max_turnover,
-            min_decay_score=self.min_decay_score,
-            min_capacity_score=self.min_capacity_score,
-            max_correlation_penalty=self.max_correlation_penalty,
-            min_regime_robustness=self.min_regime_robustness,
-            min_out_of_sample_stability=self.min_out_of_sample_stability,
-            sort_field=self.sort_field,
-            tie_breaker_field=self.tie_breaker_field,
-        )
-
-
-@dataclass(frozen=True)
-class CorrelationScreeningConfig:
-    evaluation_source: str = "factor"
-    method: str = "greedy"
-    threshold: float = 0.75
-    score_field: str = "fitness"
 
 
 FACTOR_ROOT = str(DEFAULT_FACTOR_STORE_ROOT)
@@ -111,26 +73,52 @@ REBALANCE_FREQ = "ME"
 ANNUAL_TRADING_DAYS = 252
 TRANSACTION_COST_BPS = 5.0
 SLIPPAGE_BPS = 2.0
+RETURN_MODE = "long_short"
 OUTPUT_DIR = str(DEFAULT_OUTPUT_DIR)
 REPORT_NAME = "factor_screener_multifactor_demo"
 OPEN_BROWSER = False
 
 
-CONFIG_SINGLE_FACTOR = SingleFactorScreeningConfig()
+CONFIG_SINGLE_FACTOR = FactorMetricFilterConfig(
+    min_fitness=0.10,
+    min_ic_mean=0.01,
+    min_rank_ic_mean=0.01,
+    min_sharpe=0.40,
+    max_turnover=0.50,
+    min_decay_score=0.20,
+    min_capacity_score=0.20,
+    max_correlation_penalty=0.60,
+    min_regime_robustness=0.60,
+    min_out_of_sample_stability=0.60,
+    sort_field="fitness",
+    tie_breaker_field="ic_ir",
+)
+CONFIG_RISKFOLIO = RiskfolioConfig(
+    model="Classic",
+    rm="MV",
+    obj="Sharpe",
+    rf=0.0,
+    l=2.0,
+    hist=True,
+    method_mu="hist",
+    method_cov="hist",
+    max_kelly=False,
+    weight_bounds=(0.0, 1.0),
+)
 CONFIG_CORRELATION_STEPS = (
-    CorrelationScreeningConfig(
+    CorrelationScreenerSpec(
         evaluation_source="factor",
         method="greedy",
         threshold=0.75,
         score_field="fitness",
     ),
-    CorrelationScreeningConfig(
+    CorrelationScreenerSpec(
         evaluation_source="ic",
         method="greedy",
         threshold=0.60,
         score_field="fitness",
     ),
-    CorrelationScreeningConfig(
+    CorrelationScreenerSpec(
         evaluation_source="return",
         method="greedy",
         threshold=0.00,
@@ -159,17 +147,11 @@ def main() -> None:
     # 1) Build spec inputs for the workflow. The workflow will resolve factor
     # evaluation artifacts from the store internally.
     screener_spec = FactorScreenerSpec(
-        screening_config=CONFIG_SINGLE_FACTOR.metric_filter_config(),
+        screening_config=CONFIG_SINGLE_FACTOR,
     )
 
     correlation_specs = tuple(
-        CorrelationScreenerSpec(
-            evaluation_source=config.evaluation_source,
-            method=config.method,
-            threshold=config.threshold,
-            score_field=config.score_field,
-        )
-        for config in CONFIG_CORRELATION_STEPS
+        CONFIG_CORRELATION_STEPS
     )
 
     # 2) Run the total screener. It first applies the factor screener, then
@@ -179,18 +161,28 @@ def main() -> None:
         correlation_specs,
         factor_specs=tuple(candidate_specs),
         store=store,
+        return_mode=RETURN_MODE,
     ).run()
-    workflow_result.factor_result.save_detail(output_dir / "screener")
+    screening_effectiveness = workflow_result.validate_effectiveness(
+        spec=ScreeningEffectivenessSpec(min_retained_ratio=0.8),
+    )
 
     return_panel = workflow_result.return_panel
 
     # 3) Allocate directly from the return panel.
-    factor_weights = allocate_from_return_panel(return_panel)
+    factor_weight_series = allocate_from_return_panel(
+        return_panel,
+        config=CONFIG_RISKFOLIO,
+    )
+    weights: dict[str, float] = {
+        str(name): float(weight)
+        for name, weight in factor_weight_series.items()
+    }
 
     # 4) Backtest directly from the return panel.
     backtest_result = run_return_backtest(
         return_panel,
-        weights=factor_weights.to_dict(),
+        weights=weights,
         annual_trading_days=ANNUAL_TRADING_DAYS,
     )
 
@@ -224,6 +216,7 @@ def main() -> None:
             "open_browser": OPEN_BROWSER,
         },
         "single_factor_screening_config": asdict(CONFIG_SINGLE_FACTOR),
+        "riskfolio_config": asdict(CONFIG_RISKFOLIO),
         "correlation_screening_configs": [asdict(config) for config in CONFIG_CORRELATION_STEPS],
         "factor_names": factor_names,
         "candidate_factor_specs": [asdict(spec) for spec in candidate_specs],
@@ -233,13 +226,17 @@ def main() -> None:
         "factor_selected_factor_specs": [asdict(spec) for spec in workflow_result.factor_selected_factor_specs],
         "output_dir": str(output_dir),
         "return_panel_columns": list(return_panel.columns),
-        "factor_weights": {name: float(weight) for name, weight in factor_weights.items()},
+        "factor_weights": {name: float(weight) for name, weight in weights.items()},
         "workflow_summary": workflow_result.to_summary(),
+        "screening_effectiveness_summary": screening_effectiveness.to_summary(),
+        "screening_effectiveness_passed": bool(screening_effectiveness.passed),
+        "screening_effectiveness_failed_rules": list(screening_effectiveness.failed_rules),
         "factor_screener_summary": workflow_result.factor_result.to_summary(),
         "correlation_screener_summary": workflow_result.correlation_result.to_summary(),
         "correlation_screener_chain": [result.to_summary() for result in workflow_result.correlation_results],
         "analysis_report_path": None if report.get_report(open_browser=False) is None else str(report.get_report(open_browser=False)),
     }
+    screening_effectiveness.save(output_dir / "screener" / "screening_effectiveness")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "workflow_manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
@@ -251,13 +248,15 @@ def main() -> None:
     print(f"  factor-selected specs: {[spec.table_name for spec in workflow_result.factor_selected_factor_specs]}")
     print(f"  selected specs: {[spec.table_name for spec in workflow_result.selected_factor_specs]}")
     print(f"  correlation chain: {[result.spec.evaluation_source + ':' + result.spec.method for result in workflow_result.correlation_results]}")
+    print(f"  screening effectiveness passed: {screening_effectiveness.passed}")
     print(f"  return panel columns: {list(return_panel.columns)}")
     print("\nallocation weights:")
-    print(pd.Series(factor_weights).to_string())
+    print(factor_weight_series.to_string())
     print("\nbacktest stats:")
     print(pd.DataFrame(backtest_result["stats"]).T.to_string())
     print("\noutputs:")
     print(f"  screener detail: {output_dir / 'screener'}")
+    print(f"  screening effectiveness: {output_dir / 'screener' / 'screening_effectiveness'}")
     print(f"  analysis report: {report.get_report(open_browser=False)}")
     print(f"  workflow manifest: {output_dir / 'workflow_manifest.json'}")
 

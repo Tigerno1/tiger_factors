@@ -190,21 +190,6 @@ def select_cluster_representatives_from_correlation_matrix(
     return selected
 
 
-def select_ic_coherent_factors(
-    factors: dict[str, pd.Series | pd.DataFrame],
-    prices: pd.DataFrame,
-    *,
-    horizon: int = 1,
-    min_names: int | None = 10,
-    threshold: float = 0.75,
-    scores: dict[str, float] | None = None,
-) -> list[str]:
-    ic_corr = ic_correlation_matrix(factors, coerce_price_panel(prices), horizon=horizon, min_names=min_names)
-    if scores is None:
-        scores = {name: float(np.nan_to_num(ic_corr.loc[name].abs().mean(), nan=0.0)) for name in ic_corr.columns}
-    return greedy_select_by_correlation(scores, ic_corr, threshold=threshold)
-
-
 def select_ic_by_average_correlation(
     factors: dict[str, pd.Series | pd.DataFrame],
     prices: pd.DataFrame,
@@ -378,7 +363,6 @@ __all__ = [
     "select_cluster_representatives",
     "select_cluster_representatives_from_correlation_matrix",
     "select_factors_by_marginal_gain",
-    "select_ic_coherent_factors",
     "select_ic_by_average_correlation",
     "select_ic_by_graph_independent_set",
     "select_non_redundant_factors",

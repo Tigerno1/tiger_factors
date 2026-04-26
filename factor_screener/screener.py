@@ -21,6 +21,57 @@ from tiger_factors.factor_screener.return_adapter import ReturnAdapterSpec
 from tiger_factors.factor_screener.marginal_screener import MarginalScreener
 from tiger_factors.factor_screener.marginal_screener import MarginalScreenerResult
 from tiger_factors.factor_screener.marginal_screener import MarginalScreenerSpec
+from tiger_factors.factor_screener.validation import ScreeningEffectivenessResult
+from tiger_factors.factor_screener.validation import ScreeningEffectivenessSpec
+
+
+@dataclass(frozen=True)
+class ScreenerFinalResult:
+    factor_specs: tuple[FactorSpec, ...]
+    screened_at: pd.Timestamp
+    return_mode: str
+    return_long: pd.DataFrame
+    return_panel: pd.DataFrame
+
+    @property
+    def selected_factor_names(self) -> list[str]:
+        return [spec.table_name for spec in self.factor_specs]
+
+    @property
+    def selected_factor_specs(self) -> list[FactorSpec]:
+        return list(self.factor_specs)
+
+    def build_return_adapter(
+        self,
+        *,
+        store: FactorStore | None = None,
+        spec: ReturnAdapterSpec | None = None,
+    ) -> ReturnAdapter:
+        return ReturnAdapter(
+            spec or ReturnAdapterSpec(),
+            factor_specs=self.factor_specs,
+            store=store,
+        )
+
+    def to_summary(self) -> dict[str, object]:
+        if self.return_panel.empty:
+            return_start = None
+            return_end = None
+        else:
+            index = pd.DatetimeIndex(self.return_panel.index).dropna().sort_values()
+            return_start = None if index.empty else index[0].isoformat()
+            return_end = None if index.empty else index[-1].isoformat()
+        return {
+            "screened_at": self.screened_at.isoformat(),
+            "return_mode": self.return_mode,
+            "selected_factor_names": self.selected_factor_names,
+            "selected_count": int(len(self.factor_specs)),
+            "return_start": return_start,
+            "return_end": return_end,
+            "return_rows": int(len(self.return_long)),
+            "return_panel_rows": int(len(self.return_panel)),
+            "return_panel_columns": int(len(self.return_panel.columns)),
+        }
 
 
 @dataclass(frozen=True)
@@ -28,6 +79,9 @@ class ScreenerResult:
     factor_result: FactorScreenerResult
     correlation_results: tuple[CorrelationScreenerResult, ...]
     screened_at: pd.Timestamp
+    store: FactorStore
+    return_mode: str
+    _final_result: ScreenerFinalResult | None = None
     marginal_result: MarginalScreenerResult | None = None
     backtest_marginal_result: BacktestMarginalScreenerResult | None = None
 
@@ -118,48 +172,44 @@ class ScreenerResult:
 
     @property
     def return_long(self) -> pd.DataFrame:
-        if self.backtest_marginal_result is not None:
-            return self.backtest_marginal_result.return_long
-        if self.marginal_result is not None:
-            return self.marginal_result.return_long
-        if not self.correlation_results or self.correlation_results[-1].return_panel.empty:
-            return pd.DataFrame(columns=["date_", "factor", "return", "return_mode"])
-        long_frame = (
-            self.correlation_results[-1].return_panel.copy()
-            .sort_index()
-            .stack(dropna=False)
-            .rename("return")
-            .reset_index()
-        )
-        if long_frame.empty:
-            return pd.DataFrame(columns=["date_", "factor", "return", "return_mode"])
-        long_frame.columns = ["date_", "factor", "return"]
-        long_frame["return_mode"] = str(self.correlation_results[-1].spec.evaluation_source)
-        long_frame = long_frame.dropna(subset=["date_", "return"])
-        return long_frame.loc[:, ["date_", "factor", "return", "return_mode"]].sort_values(
-            ["date_", "factor"],
-            kind="stable",
-        )
+        return self.final_result.return_long
 
     @property
     def return_panel(self) -> pd.DataFrame:
-        if self.backtest_marginal_result is not None and not self.backtest_marginal_result.return_panel.empty:
-            return self.backtest_marginal_result.return_panel
-        if self.marginal_result is not None and not self.marginal_result.return_panel.empty:
-            return self.marginal_result.return_panel
-        if self.correlation_results and not self.correlation_results[-1].return_panel.empty:
-            return self.correlation_results[-1].return_panel
-        return self.factor_result.return_panel
+        return self.final_result.return_panel
+
+    @property
+    def final_result(self) -> ScreenerFinalResult:
+        if self._final_result is not None:
+            return self._final_result
+        adapter_result = self.build_return_adapter(store=self.store).run()
+        return ScreenerFinalResult(
+            factor_specs=tuple(self.selected_factor_specs),
+            screened_at=self.screened_at,
+            return_mode=self.return_mode,
+            return_long=adapter_result.return_long,
+            return_panel=adapter_result.return_panel,
+        )
 
     def build_return_adapter(
         self,
         *,
         store: FactorStore | None = None,
         spec: ReturnAdapterSpec | None = None,
+        source: str = "selected",
     ) -> ReturnAdapter:
+        normalized_source = str(source).strip().lower()
+        if normalized_source == "selected":
+            factor_specs = self.selected_factor_specs
+        elif normalized_source == "screened":
+            factor_specs = self.screened_factor_specs
+        elif normalized_source == "input":
+            factor_specs = self.factor_result.factor_specs
+        else:
+            raise ValueError(f"unknown return adapter source: {source!r}")
         return ReturnAdapter(
-            spec or ReturnAdapterSpec(),
-            factor_specs=self.selected_factor_specs,
+            spec or ReturnAdapterSpec(return_mode=self.return_mode),
+            factor_specs=factor_specs,
             store=store,
         )
 
@@ -190,6 +240,13 @@ class ScreenerResult:
             or factor_summary.get("return_end"),
         }
 
+    def validate_effectiveness(
+        self,
+        *,
+        spec: ScreeningEffectivenessSpec | None = None,
+    ) -> ScreeningEffectivenessResult:
+        return self.factor_result.validate_effectiveness(spec=spec)
+
 
 class Screener:
     def __init__(
@@ -200,6 +257,7 @@ class Screener:
         factor_specs: Iterable[FactorSpec],
         store: FactorStore | None = None,
         mode: str = "correlation",
+        return_mode: str = "long_short",
         marginal_spec: MarginalScreenerSpec | None = None,
         backtest_marginal_spec: BacktestMarginalScreenerSpec | None = None,
     ) -> None:
@@ -208,6 +266,7 @@ class Screener:
         self.factor_specs = tuple(factor_specs)
         self.store = store or FactorStore()
         self.mode = str(mode).strip().lower()
+        self.return_mode = str(return_mode).strip().lower()
         self.marginal_spec = marginal_spec
         self.backtest_marginal_spec = backtest_marginal_spec
 
@@ -221,6 +280,7 @@ class Screener:
         correlation_results: list[CorrelationScreenerResult] = []
         marginal_result: MarginalScreenerResult | None = None
         backtest_marginal_result: BacktestMarginalScreenerResult | None = None
+        selected_specs: tuple[FactorSpec, ...] = factor_selected_specs
 
         if self.mode == "correlation":
             current_specs = factor_selected_specs
@@ -244,6 +304,7 @@ class Screener:
                     )
                 correlation_results.append(correlation_result)
                 current_specs = correlation_result.selected_factor_specs
+            selected_specs = tuple(current_specs)
         elif self.mode == "marginal":
             if self.marginal_spec is None:
                 raise ValueError("marginal_spec is required when Screener.mode='marginal'")
@@ -252,6 +313,7 @@ class Screener:
                 factor_specs=factor_selected_specs,
                 store=self.store,
             ).run()
+            selected_specs = tuple(marginal_result.selected_factor_specs)
         elif self.mode == "backtest_marginal":
             if self.backtest_marginal_spec is None:
                 raise ValueError("backtest_marginal_spec is required when Screener.mode='backtest_marginal'")
@@ -260,16 +322,31 @@ class Screener:
                 factor_specs=factor_selected_specs,
                 store=self.store,
             ).run()
+            selected_specs = tuple(backtest_marginal_result.selected_factor_specs)
         else:
             raise ValueError(f"unknown screener mode: {self.mode!r}")
 
         screened_at = pd.Timestamp.now(tz="UTC")
+        adapter_result = ReturnAdapter(
+            ReturnAdapterSpec(return_mode=self.return_mode),
+            factor_specs=selected_specs,
+            store=self.store,
+        ).run()
         return ScreenerResult(
             factor_result=factor_result,
             correlation_results=tuple(correlation_results),
             marginal_result=marginal_result,
             backtest_marginal_result=backtest_marginal_result,
             screened_at=screened_at,
+            store=self.store,
+            return_mode=self.return_mode,
+            _final_result=ScreenerFinalResult(
+                factor_specs=selected_specs,
+                screened_at=screened_at,
+                return_mode=self.return_mode,
+                return_long=adapter_result.return_long,
+                return_panel=adapter_result.return_panel,
+            ),
         )
 
 
@@ -280,6 +357,7 @@ def run_screener(
     *,
     store: FactorStore | None = None,
     mode: str = "correlation",
+    return_mode: str = "long_short",
     marginal_spec: MarginalScreenerSpec | None = None,
     backtest_marginal_spec: BacktestMarginalScreenerSpec | None = None,
 ) -> ScreenerResult:
@@ -289,6 +367,7 @@ def run_screener(
         factor_specs=factor_specs,
         store=store,
         mode=mode,
+        return_mode=return_mode,
         marginal_spec=marginal_spec,
         backtest_marginal_spec=backtest_marginal_spec,
     ).run()

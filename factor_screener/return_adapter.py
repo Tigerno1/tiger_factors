@@ -3,67 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-import numpy as np
 import pandas as pd
 
+from tiger_factors.factor_screener._evaluation_io import load_return_series
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
-
-
-def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Series:
-    cleaned = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    if cleaned.empty:
-        return cleaned
-    cleaned.index = pd.to_datetime(cleaned.index, errors="coerce")
-    cleaned = cleaned[~cleaned.index.isna()].sort_index()
-    cleaned.name = factor_name
-    return cleaned
-
-
-def _pick_return_column(frame: pd.DataFrame, *, return_mode: str) -> str:
-    lookup = {str(column): column for column in frame.columns}
-    preferred_mode = str(return_mode).strip().lower()
-    if preferred_mode in lookup:
-        return str(lookup[preferred_mode])
-    for candidate in ("long_short", "long_short_returns", "factor_portfolio_returns", "returns", "return", "1D"):
-        if candidate in lookup:
-            return str(lookup[candidate])
-    numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
-    if numeric_columns:
-        return str(numeric_columns[0])
-    raise KeyError(f"could not infer return column from: {list(frame.columns)!r}")
-
-
-def _load_return_series(
-    store: FactorStore,
-    spec: FactorSpec,
-    *,
-    return_mode: str,
-    return_table_name: str,
-) -> pd.Series | None:
-    try:
-        frame = store.evaluation.returns(spec).get_table(return_table_name)
-    except FileNotFoundError:
-        return None
-    if isinstance(frame, pd.Series):
-        return _normalize_return_series(frame, factor_name=spec.table_name)
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return None
-    working = frame.copy()
-    if "date_" in working.columns:
-        working["date_"] = pd.to_datetime(working["date_"], errors="coerce")
-        working = working.loc[working["date_"].notna()]
-    if "date_" in working.columns:
-        numeric_columns = [column for column in working.columns if column != "date_" and pd.api.types.is_numeric_dtype(working[column])]
-        if numeric_columns:
-            column = _pick_return_column(working[numeric_columns], return_mode=return_mode)
-            series = pd.Series(pd.to_numeric(working[column], errors="coerce").to_numpy(), index=working["date_"], name=spec.table_name)
-            return _normalize_return_series(series, factor_name=spec.table_name)
-    column = _pick_return_column(working, return_mode=return_mode)
-    series = working[column]
-    if isinstance(series, pd.DataFrame):
-        series = series.squeeze(axis=1)
-    return _normalize_return_series(series, factor_name=spec.table_name)
 
 
 @dataclass(frozen=True)
@@ -139,7 +83,7 @@ class ReturnAdapter:
         return_series_map: dict[str, pd.Series] = {}
         missing_return_factors: list[str] = []
         for factor_spec in self.factor_specs:
-            series = _load_return_series(
+            series = load_return_series(
                 self.store,
                 factor_spec,
                 return_mode=self.spec.return_mode,

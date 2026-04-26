@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from tiger_factors.multifactor_evaluation import LongShortReturnConfig
-from tiger_factors.multifactor_evaluation import RiskfolioConfig
-from tiger_factors.multifactor_evaluation import allocate_selected_factors
-from tiger_factors.multifactor_evaluation import build_long_short_return_panel
-from tiger_factors.multifactor_evaluation import compute_factor_long_short_returns
-from tiger_factors.multifactor_evaluation import optimize_factor_weights_with_riskfolio
+from tiger_factors.factor_allocation import LongShortReturnConfig
+from tiger_factors.factor_allocation import RiskfolioConfig
+from tiger_factors.factor_allocation import allocate_selected_factors
+from tiger_factors.factor_allocation import build_long_short_return_panel
+from tiger_factors.factor_allocation import compute_factor_long_short_returns
+from tiger_factors.factor_allocation import optimize_factor_weights_with_riskfolio
 
 
 def _sample_prices_and_factors() -> tuple[pd.DataFrame, dict[str, pd.Series]]:
@@ -100,6 +101,55 @@ def test_optimize_factor_weights_with_riskfolio_uses_lazy_import(monkeypatch) ->
     assert weights.sum() == 1.0
 
 
+def test_riskfolio_config_passes_extended_kwargs(monkeypatch) -> None:
+    panel = pd.DataFrame(
+        {
+            "momentum": [0.01, 0.02, -0.01],
+            "reversal": [0.005, -0.002, 0.004],
+        },
+        index=pd.bdate_range("2024-01-01", periods=3),
+    )
+
+    captured: dict[str, dict[str, object]] = {}
+
+    class FakePortfolio:
+        def __init__(self, returns, **kwargs):
+            self.returns = returns
+            captured["portfolio_kwargs"] = kwargs
+
+        def assets_stats(self, method_mu="hist", method_cov="hist", **kwargs):
+            self.method_mu = method_mu
+            self.method_cov = method_cov
+            captured["assets_stats_kwargs"] = kwargs
+
+        def optimization(self, **kwargs):
+            captured["optimization_kwargs"] = kwargs
+            return pd.DataFrame({"weights": [0.7, 0.3]}, index=["momentum", "reversal"])
+
+    class FakeRiskfolio:
+        Portfolio = FakePortfolio
+
+    monkeypatch.setattr(
+        "tiger_factors.multifactor_evaluation.allocation._import_riskfolio",
+        lambda: FakeRiskfolio,
+    )
+
+    weights = optimize_factor_weights_with_riskfolio(
+        panel,
+        config=RiskfolioConfig(
+            portfolio_kwargs={"budget": 1.0},
+            assets_stats_kwargs={"method_kurt": "hist", "dict_mu": {"momentum": 1.0}},
+            optimization_kwargs={"allow_short": False},
+        ),
+    )
+
+    assert captured["portfolio_kwargs"] == {"budget": 1.0}
+    assert captured["assets_stats_kwargs"] == {"method_kurt": "hist", "dict_mu": {"momentum": 1.0}}
+    assert captured["optimization_kwargs"]["allow_short"] is False
+    assert weights.index.tolist() == ["momentum", "reversal"]
+    assert weights.sum() == 1.0
+
+
 def test_allocate_selected_factors_filters_by_screening_summary(monkeypatch) -> None:
     prices, factor_dict = _sample_prices_and_factors()
     screening_summary = pd.DataFrame(
@@ -126,6 +176,7 @@ def test_allocate_selected_factors_filters_by_screening_summary(monkeypatch) -> 
 
 
 def test_real_riskfolio_smoke_optimization() -> None:
+    pytest.importorskip("riskfolio")
     panel = pd.DataFrame(
         {
             "a": [0.01, 0.02, -0.01, 0.015],

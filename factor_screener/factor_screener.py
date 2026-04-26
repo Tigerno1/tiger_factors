@@ -4,52 +4,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-import numpy as np
 import pandas as pd
 
+from tiger_factors.factor_screener._evaluation_io import factor_frame_to_panel
+from tiger_factors.factor_screener._evaluation_io import normalize_time_series
+from tiger_factors.factor_screener._evaluation_io import pick_return_column
 from tiger_factors.factor_evaluation.utils import period_to_label
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
 from tiger_factors.factor_screener.screening import FactorMetricFilterConfig
 from tiger_factors.factor_screener.screening import screen_factor_metrics
-
-
-def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Series:
-    cleaned = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    if cleaned.empty:
-        return cleaned
-    cleaned.index = pd.to_datetime(cleaned.index, errors="coerce")
-    cleaned = cleaned[~cleaned.index.isna()].sort_index()
-    cleaned.name = factor_name
-    return cleaned
-
-
-def _pick_return_column(frame: pd.DataFrame, *, preferred_period: str | int | pd.Timedelta | None = None) -> str:
-    if frame.empty:
-        raise ValueError("return frame is empty")
-
-    columns = [str(column) for column in frame.columns]
-    lookup = {str(column): column for column in frame.columns}
-
-    if preferred_period is not None:
-        preferred_label = period_to_label(preferred_period)
-        if preferred_label in lookup:
-            return lookup[preferred_label]
-        if str(preferred_period) in lookup:
-            return lookup[str(preferred_period)]
-
-    for candidate in ("long_short", "long_short_returns", "factor_portfolio_returns", "returns", "return", "1D"):
-        if candidate in lookup:
-            return lookup[candidate]
-
-    if len(frame.columns) == 1:
-        return frame.columns[0]
-
-    numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
-    if numeric_columns:
-        return numeric_columns[0]
-
-    raise KeyError(f"Could not infer a return column. Available columns: {columns!r}")
+from tiger_factors.factor_screener.validation import ScreeningEffectivenessResult
+from tiger_factors.factor_screener.validation import ScreeningEffectivenessSpec
+from tiger_factors.factor_screener.validation import validate_screening_effectiveness
 
 
 def _series_to_long_frame(
@@ -98,45 +65,6 @@ def _factor_panel_data_profile(panel: pd.DataFrame) -> dict[str, float | int]:
         "data_non_na": non_na,
         "data_coverage": coverage,
     }
-
-
-def _factor_frame_to_panel(frame: pd.DataFrame, *, factor_name: str) -> pd.DataFrame:
-    if frame.empty:
-        return pd.DataFrame()
-    normalized = frame.copy()
-    if "date_" in normalized.columns:
-        normalized["date_"] = pd.to_datetime(normalized["date_"], errors="coerce")
-    if "code" in normalized.columns:
-        normalized["code"] = normalized["code"].astype(str)
-
-    if {"date_", "code"}.issubset(normalized.columns):
-        value_candidates = [
-            column
-            for column in normalized.columns
-            if column not in {"date_", "code"}
-            and pd.api.types.is_numeric_dtype(normalized[column])
-        ]
-        if not value_candidates:
-            return pd.DataFrame()
-        value_column = "value" if "value" in value_candidates else value_candidates[0]
-        panel = normalized.pivot_table(index="date_", columns="code", values=value_column, aggfunc="last")
-        panel.index = pd.to_datetime(panel.index, errors="coerce")
-        panel = panel.loc[~panel.index.isna()].sort_index()
-        panel.columns = panel.columns.astype(str)
-        panel.columns.name = factor_name
-        return panel
-
-    if isinstance(normalized.index, pd.DatetimeIndex):
-        panel = normalized.copy()
-        panel.index = pd.to_datetime(panel.index, errors="coerce")
-        panel = panel.loc[~panel.index.isna()].sort_index()
-        panel.columns = panel.columns.astype(str)
-        panel.columns.name = factor_name
-        return panel
-
-    return pd.DataFrame()
-
-
 def _load_factor_panel_from_store(
     store: FactorStore,
     spec: FactorSpec,
@@ -147,7 +75,7 @@ def _load_factor_panel_from_store(
         return pd.DataFrame()
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return pd.DataFrame()
-    panel = _factor_frame_to_panel(frame, factor_name=spec.table_name)
+    panel = factor_frame_to_panel(frame, factor_name=spec.table_name)
     return panel if isinstance(panel, pd.DataFrame) else pd.DataFrame()
 
 
@@ -282,6 +210,17 @@ class FactorScreenerResult:
             "return_modes": sorted({str(key.split(":", 1)[1]) for key in self.return_series if ":" in key}),
         }
 
+    def validate_effectiveness(
+        self,
+        *,
+        spec: ScreeningEffectivenessSpec | None = None,
+    ) -> ScreeningEffectivenessResult:
+        return validate_screening_effectiveness(
+            self.summary,
+            self.selection_summary,
+            spec=spec,
+        )
+
 
 class FactorScreener:
     def __init__(
@@ -325,7 +264,7 @@ class FactorScreener:
         except FileNotFoundError:
             return None
         if isinstance(return_frame, pd.Series):
-            return _normalize_return_series(return_frame, factor_name=factor_spec.table_name)
+            return normalize_time_series(return_frame, name=factor_spec.table_name)
         if not isinstance(return_frame, pd.DataFrame) or return_frame.empty:
             return None
         if "date_" in return_frame.columns:
@@ -336,14 +275,14 @@ class FactorScreener:
                 if column != "date_" and pd.api.types.is_numeric_dtype(return_frame[column])
             ]
             if numeric_columns:
-                column = _pick_return_column(return_frame[numeric_columns])
+                column = pick_return_column(return_frame[numeric_columns])
                 series = pd.Series(pd.to_numeric(return_frame[column], errors="coerce").to_numpy(), index=date_index, name=factor_spec.table_name)
-                return _normalize_return_series(series, factor_name=factor_spec.table_name)
-        column = _pick_return_column(return_frame)
+                return normalize_time_series(series, name=factor_spec.table_name)
+        column = pick_return_column(return_frame)
         series = return_frame[column]
         if isinstance(series, pd.DataFrame):
             series = series.squeeze(axis=1)
-        return _normalize_return_series(series, factor_name=factor_spec.table_name)
+        return normalize_time_series(series, name=factor_spec.table_name)
 
     def _stored_long_only_series(self, factor_spec: FactorSpec) -> pd.Series | None:
         section = self.store.evaluation.section(factor_spec, "returns")
@@ -363,7 +302,7 @@ class FactorScreener:
                 quantile_cols = pd.Index(quantile_frame.columns)
                 numeric_quantiles = pd.to_numeric(quantile_cols, errors="coerce")
                 top_quantile = numeric_quantiles.max() if numeric_quantiles.notna().any() else quantile_cols[-1]
-                return _normalize_return_series(quantile_frame[top_quantile], factor_name=factor_spec.table_name)
+                return normalize_time_series(quantile_frame[top_quantile], name=factor_spec.table_name)
             if isinstance(frame.columns, pd.MultiIndex) and "factor_quantile" in frame.columns.names:
                 try:
                     level = frame.columns.names.index("factor_quantile")
@@ -371,7 +310,7 @@ class FactorScreener:
                     if period_label in frame.columns:
                         quantile_frame = frame[period_label].copy()
                         if isinstance(quantile_frame, pd.Series):
-                            return _normalize_return_series(quantile_frame, factor_name=factor_spec.table_name)
+                            return normalize_time_series(quantile_frame, name=factor_spec.table_name)
                 except Exception:
                     continue
         return None

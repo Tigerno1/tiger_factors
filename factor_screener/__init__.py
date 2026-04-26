@@ -23,7 +23,6 @@ from tiger_factors.factor_screener.correlation_screener import CorrelationScreen
 from tiger_factors.factor_screener.correlation_screener import CorrelationScreenerResult
 from tiger_factors.factor_screener.correlation_screener import CorrelationScreenerSpec
 from tiger_factors.factor_screener.correlation_screener import run_correlation_screener
-from tiger_factors.factor_screener.correlation_screener import run_ic_correlation_screener
 from tiger_factors.factor_screener.backtest_marginal_screener import BacktestMarginalScreener
 from tiger_factors.factor_screener.backtest_marginal_screener import BacktestMarginalScreenerResult
 from tiger_factors.factor_screener.backtest_marginal_screener import BacktestMarginalScreenerSpec
@@ -33,6 +32,7 @@ from tiger_factors.factor_screener.return_adapter import ReturnAdapterResult
 from tiger_factors.factor_screener.return_adapter import ReturnAdapterSpec
 from tiger_factors.factor_screener.return_adapter import run_return_adapter
 from tiger_factors.factor_screener.screener import Screener
+from tiger_factors.factor_screener.screener import ScreenerFinalResult
 from tiger_factors.factor_screener.screener import ScreenerResult
 from tiger_factors.factor_screener.screener import run_screener
 from tiger_factors.factor_screener.selection import cluster_factors
@@ -44,7 +44,6 @@ from tiger_factors.factor_screener.selection import select_by_average_correlatio
 from tiger_factors.factor_screener.selection import select_by_graph_independent_set
 from tiger_factors.factor_screener.selection import select_ic_by_average_correlation
 from tiger_factors.factor_screener.selection import select_ic_by_graph_independent_set
-from tiger_factors.factor_screener.selection import select_ic_coherent_factors
 from tiger_factors.factor_screener.selection import select_non_redundant_factors
 from tiger_factors.factor_screener.marginal_screener import MarginalScreener
 from tiger_factors.factor_screener.marginal_screener import MarginalScreenerResult
@@ -76,6 +75,7 @@ __all__ = [
     "ReturnAdapter",
     "ReturnAdapterResult",
     "ReturnAdapterSpec",
+    "ScreenerFinalResult",
     "Screener",
     "ScreenerResult",
     "add_cost_analysis",
@@ -98,7 +98,6 @@ __all__ = [
     "run_single_factor_screening",
     "run_return_adapter",
     "run_correlation_screener",
-    "run_ic_correlation_screener",
     "run_marginal_screener",
     "run_backtest_marginal_screener",
     "screen_factor_metrics",
@@ -106,7 +105,6 @@ __all__ = [
     "screen_factor_results",
     "select_ic_by_average_correlation",
     "select_ic_by_graph_independent_set",
-    "select_ic_coherent_factors",
     "select_non_redundant_factors",
 ]
 

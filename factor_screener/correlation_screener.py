@@ -1,130 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 
 import pandas as pd
 
-from tiger_factors.factor_evaluation.utils import period_to_label
+from tiger_factors.factor_screener._evaluation_io import load_factor_panel
+from tiger_factors.factor_screener._evaluation_io import load_ic_series
+from tiger_factors.factor_screener._evaluation_io import load_return_series
 from tiger_factors.factor_screener.selection import select_by_graph_independent_set_from_correlation_matrix
 from tiger_factors.factor_screener.selection import select_cluster_representatives_from_correlation_matrix
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
 from tiger_factors.multifactor_evaluation._inputs import coerce_factor_series
-
-
-def _normalize_return_series(series: pd.Series, *, factor_name: str) -> pd.Series:
-    cleaned = pd.to_numeric(series, errors="coerce").replace([pd.NA, pd.NaT], pd.NA).dropna()
-    if cleaned.empty:
-        return cleaned
-    cleaned.index = pd.to_datetime(cleaned.index, errors="coerce")
-    cleaned = cleaned[~cleaned.index.isna()].sort_index()
-    cleaned.name = factor_name
-    return cleaned
-
-
-def _pick_numeric_column(frame: pd.DataFrame) -> str:
-    numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
-    if numeric_columns:
-        return str(numeric_columns[0])
-    raise KeyError(f"could not infer numeric column from: {list(frame.columns)!r}")
-
-
-def _pick_return_column(frame: pd.DataFrame, *, preferred_period: str | int | pd.Timedelta | None = None) -> str:
-    lookup = {str(column): column for column in frame.columns}
-    if preferred_period is not None:
-        preferred_label = period_to_label(preferred_period)
-        if preferred_label in lookup:
-            return str(lookup[preferred_label])
-        if str(preferred_period) in lookup:
-            return str(lookup[str(preferred_period)])
-    for candidate in ("long_short", "long_short_returns", "factor_portfolio_returns", "returns", "return", "1D"):
-        if candidate in lookup:
-            return str(lookup[candidate])
-    return _pick_numeric_column(frame)
-
-
-def _load_factor_return_series(store: FactorStore, spec: FactorSpec) -> pd.Series | None:
-    section = store.evaluation.returns(spec)
-    try:
-        frame = section.get_table("factor_portfolio_returns")
-    except FileNotFoundError:
-        return None
-    if isinstance(frame, pd.Series):
-        return _normalize_return_series(frame, factor_name=spec.table_name)
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return None
-    working = frame.copy()
-    if "date_" in working.columns:
-        working["date_"] = pd.to_datetime(working["date_"], errors="coerce")
-        working = working.loc[working["date_"].notna()]
-    if "date_" in working.columns:
-        numeric_columns = [column for column in working.columns if column != "date_" and pd.api.types.is_numeric_dtype(working[column])]
-        if numeric_columns:
-            column = _pick_return_column(working[numeric_columns])
-            series = pd.Series(pd.to_numeric(working[column], errors="coerce").to_numpy(), index=working["date_"], name=spec.table_name)
-            return _normalize_return_series(series, factor_name=spec.table_name)
-    column = _pick_return_column(working)
-    series = working[column]
-    if isinstance(series, pd.DataFrame):
-        series = series.squeeze(axis=1)
-    return _normalize_return_series(series, factor_name=spec.table_name)
-
-
-def _load_factor_ic_series(
-    store: FactorStore,
-    spec: FactorSpec,
-    *,
-    period: str | int | pd.Timedelta | None = None,
-) -> pd.Series | None:
-    section = store.evaluation.information(spec)
-    try:
-        frame = section.get_table("information_coefficient")
-    except FileNotFoundError:
-        return None
-    if isinstance(frame, pd.Series):
-        return _normalize_return_series(frame, factor_name=spec.table_name)
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return None
-    column = _pick_return_column(frame, preferred_period=period)
-    series = frame[column]
-    if isinstance(series, pd.DataFrame):
-        series = series.squeeze(axis=1)
-    return _normalize_return_series(series, factor_name=spec.table_name)
-
-
-def _load_factor_panel(store: FactorStore, spec: FactorSpec) -> pd.DataFrame:
-    try:
-        frame = store.get_factor(spec, engine="pandas")
-    except Exception:
-        return pd.DataFrame()
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return pd.DataFrame()
-    normalized = frame.copy()
-    if "date_" in normalized.columns:
-        normalized["date_"] = pd.to_datetime(normalized["date_"], errors="coerce")
-    if "code" in normalized.columns:
-        normalized["code"] = normalized["code"].astype(str)
-    if {"date_", "code"}.issubset(normalized.columns):
-        value_columns = [
-            column
-            for column in normalized.columns
-            if column not in {"date_", "code"} and pd.api.types.is_numeric_dtype(normalized[column])
-        ]
-        if not value_columns:
-            return pd.DataFrame()
-        panel = normalized.pivot_table(index="date_", columns="code", values=value_columns[0], aggfunc="last")
-        panel.index = pd.to_datetime(panel.index, errors="coerce")
-        panel = panel.loc[~panel.index.isna()].sort_index()
-        panel.columns = panel.columns.astype(str)
-        return panel
-    if isinstance(normalized.index, pd.DatetimeIndex):
-        panel = normalized.copy()
-        panel.index = pd.to_datetime(panel.index, errors="coerce")
-        panel = panel.loc[~panel.index.isna()].sort_index()
-        panel.columns = panel.columns.astype(str)
-        return panel
-    return pd.DataFrame()
 
 
 def _build_series_map(
@@ -137,11 +26,11 @@ def _build_series_map(
     series_map: dict[str, pd.Series | pd.DataFrame] = {}
     for spec in factor_specs:
         if source == "ic":
-            series = _load_factor_ic_series(store, spec, period=ic_period)
+            series = load_ic_series(store, spec, period=ic_period)
         elif source == "factor":
-            series = _load_factor_panel(store, spec)
+            series = load_factor_panel(store, spec)
         else:
-            series = _load_factor_return_series(store, spec)
+            series = load_return_series(store, spec)
         if series is not None and not series.empty:
             series_map[spec.table_name] = series
     return series_map
@@ -246,6 +135,7 @@ class CorrelationScreenerSpec:
     threshold: float = 0.75
     score_field: str = "fitness"
     ic_period: str | int | pd.Timedelta | None = None
+    extra_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -301,6 +191,7 @@ class CorrelationScreenerResult:
             "threshold": self.spec.threshold,
             "score_field": self.spec.score_field,
             "ic_period": None if self.spec.ic_period is None else str(self.spec.ic_period),
+            "extra_kwargs": dict(self.spec.extra_kwargs),
             "selected_factor_names": self.selected_factor_names,
             "selected_count": int(len(self.selected_factor_names)),
             "rejected_factor_names": self.rejected_factor_names,
@@ -338,7 +229,7 @@ class CorrelationScreener:
                 correlation_matrix=empty,
             )
         source = str(self.spec.evaluation_source).strip().lower()
-        if source not in {"factor", "ic", "return", "returns"}:
+        if source not in {"factor", "ic", "return"}:
             raise ValueError(f"unknown correlation screening evaluation_source: {self.spec.evaluation_source!r}")
         summary = _build_summary_map(self.store, self.factor_specs)
         selection_series_map = _build_series_map(
@@ -384,14 +275,32 @@ class CorrelationScreener:
 
         method = str(self.spec.method).strip().lower()
         selected_names: list[str]
-        if method in {"greedy", "default", "correlation", "non_redundant"}:
-            selected_names = _select_from_correlation_matrix(correlation_matrix, scores, threshold=float(self.spec.threshold), comparator="max")
-        elif method in {"average", "avg", "mean", "mean_corr", "average_corr"}:
-            selected_names = _select_from_correlation_matrix(correlation_matrix, scores, threshold=float(self.spec.threshold), comparator="mean")
-        elif method in {"cluster", "clustered", "cluster_representative"}:
-            selected_names = select_cluster_representatives_from_correlation_matrix(correlation_matrix, scores, threshold=float(self.spec.threshold))
-        elif method in {"graph", "independent_set", "max_independent_set", "graph_prune"}:
-            selected_names = select_by_graph_independent_set_from_correlation_matrix(correlation_matrix, scores, threshold=float(self.spec.threshold))
+        if method == "greedy":
+            selected_names = _select_from_correlation_matrix(
+                correlation_matrix,
+                scores,
+                threshold=float(self.spec.threshold),
+                comparator="max",
+            )
+        elif method == "average":
+            selected_names = _select_from_correlation_matrix(
+                correlation_matrix,
+                scores,
+                threshold=float(self.spec.threshold),
+                comparator="mean",
+            )
+        elif method == "cluster":
+            selected_names = select_cluster_representatives_from_correlation_matrix(
+                correlation_matrix,
+                scores,
+                threshold=float(self.spec.threshold),
+            )
+        elif method == "graph":
+            selected_names = select_by_graph_independent_set_from_correlation_matrix(
+                correlation_matrix,
+                scores,
+                threshold=float(self.spec.threshold),
+            )
         else:
             raise ValueError(f"unknown correlation screening method: {self.spec.method!r}")
 
@@ -460,26 +369,9 @@ def run_correlation_screener(
     ).run()
 
 
-def run_ic_correlation_screener(
-    spec: CorrelationScreenerSpec,
-    factor_specs: Iterable[FactorSpec],
-    *,
-    store: FactorStore | None = None,
-) -> CorrelationScreenerResult:
-    ic_spec = CorrelationScreenerSpec(
-        evaluation_source="ic",
-        method=spec.method,
-        threshold=spec.threshold,
-        score_field=spec.score_field,
-        ic_period=spec.ic_period,
-    )
-    return run_correlation_screener(ic_spec, factor_specs, store=store)
-
-
 __all__ = [
     "CorrelationScreener",
     "CorrelationScreenerResult",
     "CorrelationScreenerSpec",
     "run_correlation_screener",
-    "run_ic_correlation_screener",
 ]

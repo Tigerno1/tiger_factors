@@ -16,6 +16,7 @@ from tiger_factors.factor_screener import ReturnAdapter
 from tiger_factors.factor_screener import ReturnAdapterSpec
 from tiger_factors.factor_screener import MarginalScreener
 from tiger_factors.factor_screener import MarginalScreenerSpec
+from tiger_factors.factor_screener import ScreeningEffectivenessSpec
 from tiger_factors.factor_screener import Screener
 
 
@@ -322,6 +323,18 @@ def test_tiger_screener_flow_summary_includes_group(tmp_path: Path) -> None:
     assert summary["return_end"] is not None
 
 
+def test_correlation_screener_spec_preserves_extra_kwargs() -> None:
+    spec = CorrelationScreenerSpec(
+        evaluation_source="ic",
+        method="greedy",
+        threshold=0.7,
+        score_field="fitness",
+        extra_kwargs={"min_periods": 20, "window": 5},
+    )
+
+    assert spec.extra_kwargs == {"min_periods": 20, "window": 5}
+
+
 def test_total_screener_dispatches_factor_and_correlation_screeners(tmp_path: Path) -> None:
     store = FactorStore(tmp_path)
     dates = pd.bdate_range("2024-01-02", periods=4)
@@ -405,6 +418,112 @@ def test_total_screener_dispatches_factor_and_correlation_screeners(tmp_path: Pa
     ).run()
     assert list(adapter_result.return_panel.columns) == ["alpha_a"]
     assert not adapter_result.return_long.empty
+
+    raw_adapter_result = result.build_return_adapter(
+        store=store,
+        spec=ReturnAdapterSpec(return_mode="long_short"),
+        source="input",
+    ).run()
+    assert set(raw_adapter_result.return_panel.columns) == {"alpha_a", "alpha_b"}
+
+
+def test_screening_effectiveness_validation_flags_quality_retention(tmp_path: Path) -> None:
+    store = FactorStore(tmp_path)
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    codes = ["AAPL", "MSFT", "NVDA"]
+
+    for factor_name, summary_row, returns in (
+        (
+            "alpha_good",
+            {
+                "factor_name": "alpha_good",
+                "ic_mean": 0.05,
+                "rank_ic_mean": 0.04,
+                "ic_ir": 1.20,
+                "sharpe": 0.90,
+                "turnover": 0.20,
+                "fitness": 0.55,
+                "decay_score": 0.60,
+                "capacity_score": 0.70,
+                "regime_robustness": 0.80,
+                "out_of_sample_stability": 0.75,
+            },
+            [0.01, 0.02, 0.03],
+        ),
+        (
+            "alpha_bad",
+            {
+                "factor_name": "alpha_bad",
+                "ic_mean": -0.02,
+                "rank_ic_mean": -0.01,
+                "ic_ir": -0.50,
+                "sharpe": 0.10,
+                "turnover": 0.90,
+                "fitness": 0.05,
+                "decay_score": 0.10,
+                "capacity_score": 0.10,
+                "regime_robustness": 0.20,
+                "out_of_sample_stability": 0.15,
+            },
+            [-0.02, -0.01, 0.00],
+        ),
+    ):
+        _save_factor_artifacts(
+            store,
+            factor_name=factor_name,
+            group="core",
+            summary_row=summary_row,
+            factor_rows=[
+                {"date_": date, "code": code, "value": float(10 + date_idx + code_idx)}
+                for date_idx, date in enumerate(dates)
+                for code_idx, code in enumerate(codes)
+            ],
+        )
+        _save_return_artifacts(
+            store,
+            factor_name=factor_name,
+            group="core",
+            dates=dates,
+            returns=returns,
+        )
+
+    factor_specs = (
+        FactorSpec(provider="tiger", region="us", sec_type="stock", freq="1d", table_name="alpha_good", group="core"),
+        FactorSpec(provider="tiger", region="us", sec_type="stock", freq="1d", table_name="alpha_bad", group="core"),
+    )
+    result = FactorScreener(
+        FactorScreenerSpec(
+            screening_config=FactorMetricFilterConfig(
+                min_ic_mean=0.01,
+                min_rank_ic_mean=0.01,
+                min_sharpe=0.40,
+                max_turnover=0.50,
+                min_fitness=0.10,
+            ),
+        ),
+        factor_specs=factor_specs,
+        store=store,
+    ).run()
+
+    validation = result.validate_effectiveness(
+        spec=ScreeningEffectivenessSpec(min_retained_ratio=0.8),
+    )
+
+    assert validation.total_count == 2
+    assert validation.selected_count == 1
+    assert validation.passed is True
+    assert "turnover" in validation.metric_table["metric_name"].tolist()
+    assert bool(
+        validation.metric_table.loc[validation.metric_table["metric_name"] == "directional_fitness", "passed"].iloc[0]
+    ) is True
+    comparison = validation.comparison_frame()
+    assert "passed_overall" in comparison.columns
+    summary_frame = validation.to_summary_frame()
+    assert "record_type" in summary_frame.columns
+    saved = validation.save(tmp_path / "screening_effectiveness")
+    assert saved.exists()
+    summary_saved = validation.save_summary(tmp_path / "screening_effectiveness_summary")
+    assert summary_saved.exists()
 
 
 def test_marginal_screener_keeps_only_improving_factors(tmp_path: Path) -> None:
