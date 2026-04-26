@@ -51,6 +51,8 @@ from tiger_factors.factor_algorithm.data_mining.practical_factors import (
     factor_083_signedpower_turnrate_rank_close,
     factor_084_volume_amount_relative_strength,
     factor_085_regression_residual_volatility,
+    factor_086_low_correlation_252d,
+    factor_087_risk_adjusted_momentum_6m_12m,
 )
 from tiger_factors.utils import panel_ops as po
 
@@ -97,6 +99,38 @@ def _sample_practical_panel(include_flow: bool = True) -> pd.DataFrame:
             if include_flow:
                 row["MAIN_IN_FLOW_DAYS_10D_V2"] = float((idx % 10) + (len(code) % 3))
             rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _sample_correlation_momentum_panel() -> pd.DataFrame:
+    dates = pd.date_range("2023-01-01", periods=320, freq="D")
+    rows = []
+    configs = [
+        ("AAA", 100.0, 0.0),
+        ("BBB", 70.0, 0.4),
+        ("CCC", 90.0, 1.7),
+        ("DDD", 120.0, 2.8),
+    ]
+    for code, base, phase in configs:
+        for idx, date in enumerate(dates):
+            trend = 0.12 * idx * (1.0 + phase / 10.0)
+            cycle = 4.0 * np.sin(idx / 9.0 + phase) + 1.5 * np.cos(idx / 17.0 + phase)
+            close = base + trend + cycle
+            open_ = close - 0.25 - 0.05 * np.sin(idx / 13.0 + phase)
+            high = close + 0.9 + 0.05 * np.cos(idx / 11.0 + phase)
+            low = close - 1.1
+            rows.append(
+                {
+                    "date_": date,
+                    "code": code,
+                    "AF_OPEN": open_,
+                    "AF_HIGH": high,
+                    "AF_LOW": low,
+                    "AF_CLOSE": close,
+                    "AF_VWAP": (open_ + high + low + close) / 4.0,
+                    "VOLUME": float(850_000 + idx * 2_000 + phase * 10_000),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -149,6 +183,8 @@ def test_practical_factor_registry_exposes_the_new_factor() -> None:
         "factor_083_signedpower_turnrate_rank_close",
         "factor_084_volume_amount_relative_strength",
         "factor_085_regression_residual_volatility",
+        "factor_086_low_correlation_252d",
+        "factor_087_risk_adjusted_momentum_6m_12m",
     )
 
 
@@ -622,3 +658,73 @@ def test_new_practical_factors_match_manual_formulas() -> None:
             merged[f"{factor_name}_expected"],
             equal_nan=True,
         ), factor_name
+
+
+def test_low_correlation_factor_matches_manual_formula() -> None:
+    panel = _sample_correlation_momentum_panel()
+    engine = PracticalFactorEngine(panel)
+
+    computed = factor_086_low_correlation_252d(panel)
+    factor_name = "factor_086_low_correlation_252d"
+
+    returns = engine._close_returns()
+    base = pd.DataFrame(
+        {
+            "date": engine.data["date"],
+            "symbol": engine.data["symbol"],
+            "return": returns,
+        }
+    )
+    returns_wide = base.pivot(index="date", columns="symbol", values="return").sort_index()
+    valid = returns_wide.notna()
+    counts = valid.sum(axis=1)
+    values = returns_wide.fillna(0.0)
+    peer_sum = pd.DataFrame(
+        values.sum(axis=1).to_numpy(dtype=float)[:, None] - values.to_numpy(dtype=float),
+        index=returns_wide.index,
+        columns=returns_wide.columns,
+    )
+    peer_count = pd.DataFrame(
+        counts.to_numpy(dtype=float)[:, None] - valid.to_numpy(dtype=float),
+        index=returns_wide.index,
+        columns=returns_wide.columns,
+    )
+    peer_mean = peer_sum.divide(peer_count.where(peer_count > 0.0))
+    manual_wide = -1.0 * returns_wide.rolling(252, min_periods=126).corr(peer_mean)
+    row_pos = manual_wide.index.get_indexer(engine.data["date"])
+    col_pos = manual_wide.columns.get_indexer(engine.data["symbol"])
+    manual_values = np.full(len(engine.data), np.nan, dtype=float)
+    valid_lookup = (row_pos >= 0) & (col_pos >= 0)
+    manual_values[valid_lookup] = manual_wide.to_numpy(dtype=float)[row_pos[valid_lookup], col_pos[valid_lookup]]
+    manual = pd.Series(manual_values, index=engine.data.index)
+    expected = engine._finalize(manual, factor_name)
+
+    merged = computed.merge(expected, on=["date_", "code"], how="inner", suffixes=("", "_expected"))
+    assert not merged.empty
+    assert np.allclose(
+        merged[factor_name],
+        merged[f"{factor_name}_expected"],
+        equal_nan=True,
+    )
+
+
+def test_risk_adjusted_momentum_factor_matches_manual_formula() -> None:
+    panel = _sample_correlation_momentum_panel()
+    engine = PracticalFactorEngine(panel)
+
+    computed = factor_087_risk_adjusted_momentum_6m_12m(panel)
+    factor_name = "factor_087_risk_adjusted_momentum_6m_12m"
+
+    returns = engine._close_returns()
+    rar_6m = engine._cs_rank(engine._risk_adjusted_return(returns, 126))
+    rar_12m = engine._cs_rank(engine._risk_adjusted_return(returns, 252))
+    manual = pd.concat([rar_6m, rar_12m], axis=1).mean(axis=1, skipna=False)
+    expected = engine._finalize(manual, factor_name)
+
+    merged = computed.merge(expected, on=["date_", "code"], how="inner", suffixes=("", "_expected"))
+    assert not merged.empty
+    assert np.allclose(
+        merged[factor_name],
+        merged[f"{factor_name}_expected"],
+        equal_nan=True,
+    )

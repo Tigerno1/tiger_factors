@@ -3,11 +3,14 @@
 This folder contains the "practical" factor variants cleaned from the
 screenshots and rewritten into directly testable Python.
 
-Current factor:
+Current factors include the original practical formulas plus two named
+multi-factor building blocks:
 
 - `factor_001_volume_flow_sine_skew`
+- `factor_086_low_correlation_252d`
+- `factor_087_risk_adjusted_momentum_6m_12m`
 
-Formula:
+Original `factor_001_volume_flow_sine_skew` formula:
 
 ```text
 -1 * (SIN(TS_MEAN(AF_CLOSE/TS_DELAY(AF_CLOSE,1)-1,5))

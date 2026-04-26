@@ -209,6 +209,59 @@ class PracticalFactorEngine(DataMiningEngine):
     def _rolling_max_drawdown(self, series: pd.Series, window: int) -> pd.Series:
         return po.rolling_max_drawdown(self.data, series, window)
 
+    def _close_returns(self) -> pd.Series:
+        previous_close = self._delay(self.data["close"], 1).replace(0, np.nan)
+        returns = self.data["close"] / previous_close - 1.0
+        return pd.to_numeric(returns, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    def _low_peer_correlation(self, returns: pd.Series, window: int, *, min_periods: int | None = None) -> pd.Series:
+        window = int(max(window, 3))
+        min_periods = int(max(min_periods if min_periods is not None else window // 2, 3))
+        min_periods = min(min_periods, window)
+
+        base = pd.DataFrame(
+            {
+                "date": self.data["date"],
+                "symbol": self.data["symbol"],
+                "return": pd.to_numeric(returns, errors="coerce"),
+            }
+        )
+        returns_wide = base.pivot(index="date", columns="symbol", values="return").sort_index()
+        if returns_wide.empty or returns_wide.shape[1] < 2:
+            return pd.Series(np.nan, index=self.data.index, dtype=float)
+
+        valid = returns_wide.notna()
+        counts = valid.sum(axis=1)
+        values = returns_wide.fillna(0.0)
+        peer_sum = pd.DataFrame(
+            values.sum(axis=1).to_numpy(dtype=float)[:, None] - values.to_numpy(dtype=float),
+            index=returns_wide.index,
+            columns=returns_wide.columns,
+        )
+        peer_count = pd.DataFrame(
+            counts.to_numpy(dtype=float)[:, None] - valid.to_numpy(dtype=float),
+            index=returns_wide.index,
+            columns=returns_wide.columns,
+        )
+        peer_mean = peer_sum.divide(peer_count.where(peer_count > 0.0))
+        corr = returns_wide.rolling(window, min_periods=min_periods).corr(peer_mean)
+        factor_wide = -1.0 * corr.replace([np.inf, -np.inf], np.nan)
+
+        row_pos = factor_wide.index.get_indexer(self.data["date"])
+        col_pos = factor_wide.columns.get_indexer(self.data["symbol"])
+        aligned = np.full(len(self.data), np.nan, dtype=float)
+        valid_lookup = (row_pos >= 0) & (col_pos >= 0)
+        if valid_lookup.any():
+            aligned[valid_lookup] = factor_wide.to_numpy(dtype=float)[row_pos[valid_lookup], col_pos[valid_lookup]]
+        return pd.Series(aligned, index=self.data.index)
+
+    def _risk_adjusted_return(self, returns: pd.Series, window: int) -> pd.Series:
+        window = int(max(window, 2))
+        total_return = self.data["close"] / self._delay(self.data["close"], window).replace(0, np.nan) - 1.0
+        volatility = self._ts_std(returns, window).replace(0, np.nan)
+        adjusted = total_return / volatility
+        return pd.to_numeric(adjusted, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
     def _resolve_main_in_flow(self) -> pd.Series:
         if "main_in_flow_days_10d_v2" in self.data.columns:
             return self.data["main_in_flow_days_10d_v2"]
@@ -474,6 +527,16 @@ class PracticalFactorEngine(DataMiningEngine):
         residual = self._cs_regression_residual(self.data["close"], self.data["volume"])
         return -1.0 * self._ts_std(residual, 20)
 
+    def factor_086_low_correlation_252d(self) -> pd.Series:
+        return self._low_peer_correlation(self._close_returns(), 252)
+
+    def factor_087_risk_adjusted_momentum_6m_12m(self) -> pd.Series:
+        returns = self._close_returns()
+        rar_6m = self._cs_rank(self._risk_adjusted_return(returns, 126))
+        rar_12m = self._cs_rank(self._risk_adjusted_return(returns, 252))
+        combined = pd.concat([rar_6m, rar_12m], axis=1).mean(axis=1, skipna=False)
+        return pd.to_numeric(combined, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
 
 def factor_001_volume_flow_sine_skew(data: pd.DataFrame) -> pd.DataFrame:
     engine = PracticalFactorEngine(data)
@@ -705,6 +768,16 @@ def factor_085_regression_residual_volatility(data: pd.DataFrame) -> pd.DataFram
     return engine.compute("factor_085_regression_residual_volatility")
 
 
+def factor_086_low_correlation_252d(data: pd.DataFrame) -> pd.DataFrame:
+    engine = PracticalFactorEngine(data)
+    return engine.compute("factor_086_low_correlation_252d")
+
+
+def factor_087_risk_adjusted_momentum_6m_12m(data: pd.DataFrame) -> pd.DataFrame:
+    engine = PracticalFactorEngine(data)
+    return engine.compute("factor_087_risk_adjusted_momentum_6m_12m")
+
+
 def available_practical_factors() -> tuple[str, ...]:
     return (
         "factor_001_volume_flow_sine_skew",
@@ -753,6 +826,8 @@ def available_practical_factors() -> tuple[str, ...]:
         "factor_083_signedpower_turnrate_rank_close",
         "factor_084_volume_amount_relative_strength",
         "factor_085_regression_residual_volatility",
+        "factor_086_low_correlation_252d",
+        "factor_087_risk_adjusted_momentum_6m_12m",
     )
 
 
@@ -1066,6 +1141,18 @@ PRACTICAL_FACTOR_SPECS: tuple[PracticalFactorSpec, ...] = (
         source="-TS_STDDEV[1](CS_REGRESSION[2](CLOSE, VOLUME, OUT_TYPE=0), 20)",
         builder=PracticalFactorEngine.factor_085_regression_residual_volatility,
     ),
+    PracticalFactorSpec(
+        name="factor_086_low_correlation_252d",
+        description="-rolling_corr(stock_return, equal_weight_peer_return_ex_self, 252)",
+        source="-ROLLING_CORR(RET_1D, PEER_EQUAL_WEIGHT_RET_EX_SELF, 252)",
+        builder=PracticalFactorEngine.factor_086_low_correlation_252d,
+    ),
+    PracticalFactorSpec(
+        name="factor_087_risk_adjusted_momentum_6m_12m",
+        description="mean(rank(6m_total_return / 6m_volatility), rank(12m_total_return / 12m_volatility))",
+        source="AVG(RANK(RET_126D / VOL_126D), RANK(RET_252D / VOL_252D))",
+        builder=PracticalFactorEngine.factor_087_risk_adjusted_momentum_6m_12m,
+    ),
 )
 
 
@@ -1120,4 +1207,6 @@ __all__ = [
     "factor_083_signedpower_turnrate_rank_close",
     "factor_084_volume_amount_relative_strength",
     "factor_085_regression_residual_volatility",
+    "factor_086_low_correlation_252d",
+    "factor_087_risk_adjusted_momentum_6m_12m",
 ]
