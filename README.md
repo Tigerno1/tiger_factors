@@ -16,6 +16,21 @@ For factor research and combination work, the preferred split is now:
   - returns selected `FactorSpec` objects
 - `tiger_factors.factor_allocation`
   - factor-level weight allocation from return panels
+- `tiger_factors.factor_preprocessing`
+  - missing-value handling
+  - outlier detection and winsorization
+  - normalization, neutralization, and binning
+  - module guide: [`factor_preprocessing/README.md`](./factor_preprocessing/README.md)
+- `tiger_factors.factor_portfolio`
+  - factor-to-stock weight penetration
+  - positions frames and portfolio backtest handoff
+- `tiger_factors.factor_test`
+  - multiple-testing control
+  - convexity, decay, and recent-IC stability tests
+  - standalone market-state detection and summaries
+  - regime-conditioned factor diagnostics
+  - one-shot regime report entrypoint
+  - module guide: [`factor_test/README.md`](./factor_test/README.md)
 - `tiger_factors.factor_backtest`
   - return-based backtesting
 - `tiger_factors.multifactor_evaluation`
@@ -124,6 +139,7 @@ The preferred split is:
 
 - `tiger_factors.factor_evaluation.evaluate_factor_panel()` for single-factor diagnostics
 - `tiger_factors.factor_screener` for screening and factor-spec selection
+- `tiger_factors.factor_preprocessing` for factor cleaning and normalization
 - `tiger_factors.factor_allocation` for factor-level weighting
 - `tiger_factors.factor_backtest` for return-based backtesting
 

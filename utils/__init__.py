@@ -4,37 +4,16 @@ from tiger_factors.utils.cross_sectional import (
     bucketize_quantiles,
     col_minmax_neg,
     col_minmax_pos,
-    cs_minmax_neg,
-    cs_minmax_pos,
-    cs_neutralize,
-    cs_rank,
-    cs_winsorize,
-    cs_winsorize_mad,
-    cs_zscore,
-    demean,
     group_demean,
     group_dummy_regression_residual,
     group_zscore as cs_group_zscore,
     industry_regression_residual,
     industry_size_regression_residual,
-    l1_normalize,
-    l2_normalize,
     make_industry_dummies,
     make_onehot_by_group,
-    minmax_scale,
-    normalize_cross_section,
     neutralize_by_group,
-    neutralize_cross_section,
     neutralize_industry_size,
     orthogonalize,
-    preprocess_cross_section,
-    rank_centered,
-    rank_pct,
-    robust_zscore,
-    winsorize_cross_section,
-    winsorize_mad,
-    winsorize_quantile,
-    zscore,
 )
 from tiger_factors.utils.group_operators import (
     combo_a,
@@ -143,6 +122,30 @@ from tiger_factors.utils.weighting import (
     normalize_weights,
     score_to_weights,
 )
+
+_FACTOR_PREPROCESSING_ALIASES: dict[str, tuple[str, str]] = {
+    "demean": ("tiger_factors.factor_preprocessing", "demean"),
+    "cs_minmax_neg": ("tiger_factors.factor_preprocessing", "cs_minmax_neg"),
+    "cs_minmax_pos": ("tiger_factors.factor_preprocessing", "cs_minmax_pos"),
+    "cs_neutralize": ("tiger_factors.factor_preprocessing", "cs_neutralize"),
+    "cs_rank": ("tiger_factors.factor_preprocessing", "cs_rank"),
+    "cs_winsorize": ("tiger_factors.factor_preprocessing", "cs_winsorize"),
+    "cs_winsorize_mad": ("tiger_factors.factor_preprocessing", "cs_winsorize_mad"),
+    "cs_zscore": ("tiger_factors.factor_preprocessing", "cs_zscore"),
+    "l1_normalize": ("tiger_factors.factor_preprocessing", "l1_normalize"),
+    "l2_normalize": ("tiger_factors.factor_preprocessing", "l2_normalize"),
+    "minmax_scale": ("tiger_factors.factor_preprocessing", "minmax_scale"),
+    "normalize_cross_section": ("tiger_factors.factor_preprocessing", "normalize_cross_section"),
+    "neutralize_cross_section": ("tiger_factors.factor_preprocessing", "neutralize_cross_section"),
+    "preprocess_cross_section": ("tiger_factors.factor_preprocessing", "preprocess_cross_section"),
+    "rank_centered": ("tiger_factors.factor_preprocessing", "rank_centered"),
+    "rank_pct": ("tiger_factors.factor_preprocessing", "rank_pct"),
+    "robust_zscore": ("tiger_factors.factor_preprocessing", "robust_zscore"),
+    "winsorize_cross_section": ("tiger_factors.factor_preprocessing", "winsorize_cross_section"),
+    "winsorize_mad": ("tiger_factors.factor_preprocessing", "winsorize_mad"),
+    "winsorize_quantile": ("tiger_factors.factor_preprocessing", "winsorize_quantile"),
+    "zscore": ("tiger_factors.factor_preprocessing", "zscore"),
+}
 __all__ = [
     "bucketize_quantiles",
     "combo_a",
@@ -276,3 +279,15 @@ __all__ = [
     "normalize_weights",
     "score_to_weights",
 ]
+
+
+def __getattr__(name: str):
+    target = _FACTOR_PREPROCESSING_ALIASES.get(name)
+    if target is not None:
+        from importlib import import_module
+
+        module = import_module(target[0])
+        value = getattr(module, target[1])
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module 'tiger_factors.utils' has no attribute {name!r}")

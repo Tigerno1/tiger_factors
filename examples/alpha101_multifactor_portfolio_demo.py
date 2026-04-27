@@ -46,6 +46,7 @@ import pandas as pd
 from tiger_factors.factor_store import AdjPriceSpec
 from tiger_factors.factor_store import FactorSpec
 from tiger_factors.factor_store import FactorStore
+from tiger_factors.factor_portfolio import summarize_factor_portfolio_holdings
 from tiger_factors.multifactor_evaluation._inputs import coerce_factor_series
 from tiger_factors.multifactor_evaluation._inputs import coerce_price_panel
 from tiger_factors.multifactor_evaluation.pipeline import FactorPipelineConfig
@@ -162,6 +163,7 @@ def _write_outputs(
     output_dir: Path,
     *,
     result,
+    holdings_summary: dict[str, object] | None,
     selected_factor_names: list[str],
     factor_names: list[str],
     price_location: str,
@@ -176,6 +178,13 @@ def _write_outputs(
     result.correlation_matrix.to_csv(output_dir / "alpha101_factor_correlation_matrix.csv")
     pd.Series(selected_factor_names, name="factor").to_csv(output_dir / "alpha101_selected_factors.csv", index=False)
     pd.Series(result.factor_weights, name="weight").to_csv(output_dir / "alpha101_factor_weights.csv")
+    if holdings_summary is not None:
+        positions = holdings_summary.get("positions")
+        latest_holdings = holdings_summary.get("latest_holdings")
+        if isinstance(positions, pd.DataFrame):
+            positions.to_csv(output_dir / "alpha101_positions.csv", index=False)
+        if isinstance(latest_holdings, pd.DataFrame):
+            latest_holdings.to_csv(output_dir / "alpha101_latest_holdings.csv", index=False)
     to_parquet_clean(result.combined_factor, output_dir / "alpha101_combined_factor.parquet")
     to_parquet_clean(backtest_returns, output_dir / "alpha101_backtest_returns.parquet")
     to_parquet_clean(pd.DataFrame(result.backtest_stats).T, output_dir / "alpha101_backtest_stats.parquet")
@@ -293,6 +302,15 @@ def main() -> None:
         report_dir=output_dir / "report" if not args.no_persist else None,
         report_factor_name=args.report_factor_name,
     )
+    selected_panels = {name: factor_panels[name] for name in result.selected_factors if name in factor_panels}
+    holdings_summary = summarize_factor_portfolio_holdings(
+        selected_panels,
+        factor_weights=result.factor_weights,
+        long_only=False,
+        gross_exposure=1.0,
+        standardize=True,
+        top_n=20,
+    )
 
     print("Alpha101 multifactor demo complete.")
     print("Candidate factors:")
@@ -301,6 +319,8 @@ def main() -> None:
     print(result.selected_factors)
     print("Factor weights:")
     print(result.factor_weights)
+    print("Latest holdings:")
+    print(holdings_summary["latest_holdings"].to_string(index=False))
     print("Portfolio stats:")
     print(json.dumps(result.backtest_stats["portfolio"], indent=2, ensure_ascii=False, default=str))
     print("Benchmark stats:")
@@ -310,6 +330,7 @@ def main() -> None:
         _write_outputs(
             output_dir,
             result=result,
+            holdings_summary=holdings_summary,
             selected_factor_names=result.selected_factors,
             factor_names=factor_names,
             price_location=f"price/{args.provider}/{args.region}/{args.sec_type}/{args.freq}/adj_price",
