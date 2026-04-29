@@ -42,8 +42,14 @@ from tiger_factors.factor_screener import ScreeningEffectivenessSpec
 from tiger_factors.factor_screener import Screener
 from tiger_factors.factor_allocation import RiskfolioConfig
 from tiger_factors.factor_allocation import allocate_from_return_panel
+from tiger_factors.factor_portfolio import TigerTradeConstraintConfig
+from tiger_factors.factor_portfolio import TigerTradeConstraintData
+from tiger_factors.factor_portfolio import apply_trade_constraints_to_scores
+from tiger_factors.factor_portfolio import apply_trade_constraints_to_weights
+from tiger_factors.factor_portfolio import build_tradeable_universe_mask
 from tiger_factors.factor_portfolio import run_weight_panel_backtest
 from tiger_factors.factor_portfolio import standardize_cross_section
+from tiger_factors.factor_portfolio import summarize_trade_constraints
 from tiger_factors.factor_portfolio import weights_to_positions_frame
 from tiger_factors.multifactor_evaluation.reporting.analysis_report import create_analysis_report
 
@@ -64,7 +70,7 @@ DEFAULT_FACTOR_NAMES = (
 FACTOR_ROOT = str(DEFAULT_FACTOR_STORE_ROOT)
 FACTOR_PROVIDER = "tiger"
 FACTOR_VARIANT: str | None = None
-FACTOR_GROUP: str | None = "core"
+FACTOR_GROUP: str | None = "alpha_101"
 REGION = "us"
 SEC_TYPE = "stock"
 FREQ = "1d"
@@ -82,17 +88,22 @@ TRANSACTION_COST_BPS = 5.0
 SLIPPAGE_BPS = 2.0
 RETURN_MODE = "long_short"
 PRICE_PROVIDER = "yahoo"
+CLASSIFICATION_PROVIDER = "simfin"
+CLASSIFICATION_DATASET = "companies"
+INDUSTRY_COLUMN = "sector"
 OUTPUT_DIR = str(DEFAULT_OUTPUT_DIR)
 REPORT_NAME = "factor_screener_multifactor_demo"
 OPEN_BROWSER = False
 TOP_HOLDINGS_N = 30
 STOCK_GROSS_EXPOSURE = 1.0
+SHORTABLE_CODES: tuple[str, ...] | None = None
+HALTED_CODES: tuple[str, ...] = ()
 
 
 CONFIG_SINGLE_FACTOR = FactorMetricFilterConfig(
-    min_fitness=0.10,
-    min_ic_mean=0.01,
-    min_rank_ic_mean=0.01,
+    min_fitness=0.02,
+    min_ic_mean=0.005,
+    min_rank_ic_mean=0.005,
     min_sharpe=0.40,
     max_turnover=0.50,
     min_decay_score=0.20,
@@ -114,6 +125,20 @@ CONFIG_RISKFOLIO = RiskfolioConfig(
     method_cov="hist",
     max_kelly=False,
     weight_bounds=(0.0, 1.0),
+)
+CONFIG_TRADE_CONSTRAINTS = TigerTradeConstraintConfig(
+    min_price=5.0,
+    min_market_cap=500_000_000.0,
+    min_dollar_volume=10_000_000.0,
+    dollar_volume_window=20,
+    require_price=True,
+    require_volume=False,
+    exclude_halted=True,
+    require_shortable_for_short=True,
+    max_single_name_weight=0.05,
+    max_industry_weight=0.30,
+    min_eligible_assets=10,
+    normalize_after_constraints=True,
 )
 CONFIG_CORRELATION_STEPS = (
     CorrelationScreenerSpec(
@@ -164,19 +189,106 @@ def _build_equal_weight_composite_signal(factor_panels: dict[str, pd.DataFrame])
     return pd.DataFrame(composite, index=pd.DatetimeIndex(common_index), columns=common_columns).sort_index()
 
 
-def _select_assets_from_scores(scores: pd.Series, *, long_short: bool) -> tuple[list[str], list[str]]:
+def _pivot_price_field(price_df: pd.DataFrame, field: str, columns: list[str]) -> pd.DataFrame:
+    if price_df.empty or field not in price_df.columns:
+        return pd.DataFrame()
+    frame = price_df.loc[:, ["date_", "code", field]].copy()
+    frame["date_"] = pd.to_datetime(frame["date_"], errors="coerce").dt.tz_localize(None)
+    frame["code"] = frame["code"].astype(str)
+    frame[field] = pd.to_numeric(frame[field], errors="coerce")
+    return (
+        frame.dropna(subset=["date_", "code"])
+        .pivot_table(index="date_", columns="code", values=field, aggfunc="last")
+        .sort_index()
+        .reindex(columns=columns)
+    )
+
+
+def _load_price_and_constraint_panels(
+    library: TigerFactorLibrary,
+    *,
+    codes: list[str],
+    start: str,
+    end: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    price_df = library.fetch_price_data(
+        codes=codes,
+        start=start,
+        end=end,
+        provider=PRICE_PROVIDER,
+    )
+    if price_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    close_raw = _pivot_price_field(price_df, "close", codes)
+    close_for_returns = close_raw.ffill()
+    volume = _pivot_price_field(price_df, "volume", codes)
+
+    market_cap = _pivot_price_field(price_df, "market_value", codes)
+    if market_cap.empty:
+        shares = _pivot_price_field(price_df, "shares_outstanding", codes)
+        if not shares.empty:
+            market_cap = close_for_returns * shares.ffill()
+    return close_raw, close_for_returns, volume, market_cap
+
+
+def _load_industry_labels(
+    library: TigerFactorLibrary,
+    *,
+    codes: list[str],
+    start: str,
+    end: str,
+) -> pd.Series | None:
+    try:
+        companies = library.fetch_fundamental_data(
+            provider=CLASSIFICATION_PROVIDER,
+            name=CLASSIFICATION_DATASET,
+            freq="static" if CLASSIFICATION_DATASET == "companies" else "1d",
+            codes=codes,
+            start=start,
+            end=end,
+        )
+    except Exception as exc:
+        print(f"  industry exposure skipped: {exc}")
+        return None
+
+    if companies.empty or "code" not in companies.columns:
+        return None
+    industry_column = next(
+        (column for column in (INDUSTRY_COLUMN, "sector", "industry", "subindustry") if column in companies.columns),
+        None,
+    )
+    if industry_column is None:
+        return None
+    labels = companies.loc[:, ["code", industry_column]].dropna(subset=["code"]).copy()
+    labels["code"] = labels["code"].astype(str)
+    labels[industry_column] = labels[industry_column].astype(str)
+    if labels.empty:
+        return None
+    return labels.groupby("code")[industry_column].last()
+
+
+def _static_shortable_series(codes: list[str]) -> pd.Series | None:
+    if SHORTABLE_CODES is None:
+        return None
+    shortable = set(map(str, SHORTABLE_CODES))
+    return pd.Series({code: code in shortable for code in codes}, dtype=bool)
+
+
+def _static_halted_series(codes: list[str]) -> pd.Series | None:
+    if not HALTED_CODES:
+        return None
+    halted = set(map(str, HALTED_CODES))
+    return pd.Series({code: code in halted for code in codes}, dtype=bool)
+
+
+def _select_assets_from_scores(scores: pd.Series, *, largest: bool) -> list[str]:
     clean = pd.to_numeric(scores, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     if clean.empty:
-        return [], []
+        return []
     k = max(int(np.ceil(len(clean) * float(LONG_PCT))), 1)
-    long_assets = clean.nlargest(k).index.astype(str).tolist()
-    if not long_short:
-        return long_assets, []
-
-    short_assets = clean.nsmallest(k).index.astype(str).tolist()
-    long_set = set(long_assets)
-    short_assets = [code for code in short_assets if code not in long_set]
-    return long_assets, short_assets
+    selected = clean.nlargest(k) if largest else clean.nsmallest(k)
+    return selected.index.astype(str).tolist()
 
 
 def _equal_weights(assets: list[str], gross: float) -> pd.Series:
@@ -184,6 +296,12 @@ def _equal_weights(assets: list[str], gross: float) -> pd.Series:
         return pd.Series(dtype=float)
     weight = float(gross) / float(len(assets))
     return pd.Series(weight, index=pd.Index(assets, dtype=str), dtype=float)
+
+
+def _write_parquet(frame: pd.DataFrame, path: Path) -> None:
+    output = frame.copy(deep=False)
+    output.attrs = {}
+    output.to_parquet(path)
 
 
 def _riskfolio_leg_weights(
@@ -221,6 +339,8 @@ def _build_stock_weight_panel(
     close_panel: pd.DataFrame,
     *,
     long_short: bool,
+    trade_data: TigerTradeConstraintData | None = None,
+    trade_constraints: TigerTradeConstraintConfig | None = None,
 ) -> pd.DataFrame:
     signal = composite_signal.sort_index()
     close = close_panel.reindex(columns=signal.columns).ffill().sort_index()
@@ -229,13 +349,35 @@ def _build_stock_weight_panel(
     if rebalance_scores.empty:
         return pd.DataFrame(index=rebalance_scores.index, columns=signal.columns, dtype=float)
 
+    long_rebalance_scores = rebalance_scores
+    short_rebalance_scores = rebalance_scores
+    if trade_data is not None and trade_constraints is not None:
+        long_rebalance_scores = apply_trade_constraints_to_scores(
+            rebalance_scores,
+            trade_data,
+            trade_constraints,
+            side="long",
+        ).values
+        if long_short:
+            short_rebalance_scores = apply_trade_constraints_to_scores(
+                rebalance_scores,
+                trade_data,
+                trade_constraints,
+                side="short",
+            ).values
+
     long_gross = float(STOCK_GROSS_EXPOSURE) if not long_short else float(STOCK_GROSS_EXPOSURE) / 2.0
     short_gross = float(STOCK_GROSS_EXPOSURE) / 2.0
     rows: list[pd.Series] = []
 
-    for rebalance_date, scores in rebalance_scores.iterrows():
+    for rebalance_date in rebalance_scores.index:
         trailing = stock_returns.loc[stock_returns.index < rebalance_date].tail(RISKFOLIO_LOOKBACK_DAYS)
-        long_assets, short_assets = _select_assets_from_scores(scores, long_short=long_short)
+        long_assets = _select_assets_from_scores(long_rebalance_scores.loc[rebalance_date], largest=True)
+        short_assets: list[str] = []
+        if long_short:
+            short_assets = _select_assets_from_scores(short_rebalance_scores.loc[rebalance_date], largest=False)
+            long_set = set(long_assets)
+            short_assets = [code for code in short_assets if code not in long_set]
 
         row = pd.Series(0.0, index=signal.columns, dtype=float)
         long_weights = _riskfolio_leg_weights(trailing, long_assets, gross=long_gross)
@@ -249,7 +391,10 @@ def _build_stock_weight_panel(
 
     weights = pd.DataFrame(rows).sort_index()
     weights.index.name = "date_"
-    return weights.reindex(columns=signal.columns).fillna(0.0)
+    weights = weights.reindex(columns=signal.columns).fillna(0.0)
+    if trade_data is not None and trade_constraints is not None:
+        weights = apply_trade_constraints_to_weights(weights, trade_data, trade_constraints)
+    return weights
 
 
 def _latest_holdings(weight_panel: pd.DataFrame, *, top_n: int) -> pd.DataFrame:
@@ -342,14 +487,32 @@ def main() -> None:
 
     price_start = START or str(composite_signal.index.min().date())
     price_end = END or str(composite_signal.index.max().date())
-    close_panel = library.price_panel(
+    close_raw_panel, close_panel, volume_panel, market_cap_panel = _load_price_and_constraint_panels(
+        library,
         codes=universe_codes,
         start=price_start,
         end=price_end,
-        provider=PRICE_PROVIDER,
     )
     if close_panel.empty:
         raise RuntimeError("Could not load a close panel for the selected stock universe.")
+    industry_labels = _load_industry_labels(
+        library,
+        codes=universe_codes,
+        start=price_start,
+        end=price_end,
+    )
+    trade_data = TigerTradeConstraintData(
+        close=close_raw_panel,
+        volume=None if volume_panel.empty else volume_panel,
+        market_cap=None if market_cap_panel.empty else market_cap_panel,
+        industry=industry_labels,
+        shortable=_static_shortable_series(universe_codes),
+        halted=_static_halted_series(universe_codes),
+    )
+    long_tradeable_mask = build_tradeable_universe_mask(trade_data, CONFIG_TRADE_CONSTRAINTS, side="long")
+    short_tradeable_mask = build_tradeable_universe_mask(trade_data, CONFIG_TRADE_CONSTRAINTS, side="short")
+    long_tradeable_summary = summarize_trade_constraints(long_tradeable_mask)
+    short_tradeable_summary = summarize_trade_constraints(short_tradeable_mask)
 
     # 4) Riskfolio decides stock holdings inside the factor-selected universe.
     # For long-short, long and short legs are optimized separately. The factor
@@ -358,6 +521,8 @@ def main() -> None:
         composite_signal,
         close_panel,
         long_short=RETURN_MODE == "long_short",
+        trade_data=trade_data,
+        trade_constraints=CONFIG_TRADE_CONSTRAINTS,
     )
     latest_holdings = _latest_holdings(stock_weight_panel, top_n=TOP_HOLDINGS_N)
     per_factor_latest_holdings = []
@@ -367,6 +532,8 @@ def main() -> None:
             factor_signal,
             close_panel,
             long_short=RETURN_MODE == "long_short",
+            trade_data=trade_data,
+            trade_constraints=CONFIG_TRADE_CONSTRAINTS,
         )
         latest = _latest_holdings(factor_weight_panel, top_n=TOP_HOLDINGS_N)
         if latest.empty:
@@ -424,6 +591,15 @@ def main() -> None:
         },
         "single_factor_screening_config": asdict(CONFIG_SINGLE_FACTOR),
         "stock_riskfolio_config": asdict(CONFIG_RISKFOLIO),
+        "trade_constraint_config": asdict(CONFIG_TRADE_CONSTRAINTS),
+        "trade_constraint_inputs": {
+            "raw_close": not close_raw_panel.empty,
+            "volume": not volume_panel.empty,
+            "market_cap": not market_cap_panel.empty,
+            "industry": industry_labels is not None,
+            "shortable": SHORTABLE_CODES is not None,
+            "halted": bool(HALTED_CODES),
+        },
         "correlation_screening_configs": [asdict(config) for config in CONFIG_CORRELATION_STEPS],
         "factor_names": factor_names,
         "candidate_factor_specs": [asdict(spec) for spec in candidate_specs],
@@ -433,12 +609,17 @@ def main() -> None:
         "factor_selected_factor_specs": [asdict(spec) for spec in workflow_result.factor_selected_factor_specs],
         "output_dir": str(output_dir),
         "return_panel_columns": list(return_panel.columns),
-        "factor_weights": {name: float(weight) for name, weight in weights.items()},
+        "factor_blend_weights": {
+            name: 1.0 / float(len(selected_factor_panels))
+            for name in selected_factor_panels
+        },
         "selected_factor_panel_shapes": {
             name: list(panel.shape)
             for name, panel in selected_factor_panels.items()
         },
         "stock_universe_count": int(len(universe_codes)),
+        "latest_long_tradeable_count": 0 if long_tradeable_summary.empty else int(long_tradeable_summary["eligible_count"].iloc[-1]),
+        "latest_short_tradeable_count": 0 if short_tradeable_summary.empty else int(short_tradeable_summary["eligible_count"].iloc[-1]),
         "stock_weight_panel_shape": list(stock_weight_panel.shape),
         "latest_holdings_date": None if latest_holdings.empty else str(latest_holdings["date_"].max()),
         "latest_holdings_count": int(len(latest_holdings)),
@@ -455,13 +636,15 @@ def main() -> None:
     }
     screening_effectiveness.save(output_dir / "screener" / "screening_effectiveness")
     output_dir.mkdir(parents=True, exist_ok=True)
-    stock_weight_panel.to_parquet(output_dir / "riskfolio_stock_weights.parquet")
-    weights_to_positions_frame(stock_weight_panel).to_parquet(output_dir / "riskfolio_stock_positions.parquet")
+    _write_parquet(stock_weight_panel, output_dir / "riskfolio_stock_weights.parquet")
+    _write_parquet(weights_to_positions_frame(stock_weight_panel), output_dir / "riskfolio_stock_positions.parquet")
     latest_holdings.to_csv(output_dir / "riskfolio_latest_holdings.csv", index=False)
-    composite_signal.to_parquet(output_dir / "selected_factor_composite_signal.parquet")
+    _write_parquet(composite_signal, output_dir / "selected_factor_composite_signal.parquet")
+    long_tradeable_summary.to_csv(output_dir / "tradeable_universe_long_summary.csv")
+    short_tradeable_summary.to_csv(output_dir / "tradeable_universe_short_summary.csv")
     if not per_factor_latest_holdings_frame.empty:
         per_factor_latest_holdings_frame.to_csv(output_dir / "selected_factor_latest_holdings_by_factor.csv", index=False)
-    stock_backtest.to_parquet(output_dir / "riskfolio_stock_backtest.parquet")
+    _write_parquet(stock_backtest, output_dir / "riskfolio_stock_backtest.parquet")
     (output_dir / "workflow_manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
@@ -475,6 +658,10 @@ def main() -> None:
     print(f"  screening effectiveness passed: {screening_effectiveness.passed}")
     print(f"  return panel columns: {list(return_panel.columns)}")
     print(f"  stock universe count: {len(universe_codes)}")
+    if not long_tradeable_summary.empty:
+        print(f"  latest long-tradeable count: {int(long_tradeable_summary['eligible_count'].iloc[-1])}")
+    if not short_tradeable_summary.empty:
+        print(f"  latest short-tradeable count: {int(short_tradeable_summary['eligible_count'].iloc[-1])}")
     print("\nlatest Riskfolio stock holdings:")
     print(latest_holdings.to_string(index=False))
     if not per_factor_latest_holdings_frame.empty:
@@ -486,6 +673,8 @@ def main() -> None:
     print(f"  screener detail: {output_dir / 'screener'}")
     print(f"  screening effectiveness: {output_dir / 'screener' / 'screening_effectiveness'}")
     print(f"  composite signal: {output_dir / 'selected_factor_composite_signal.parquet'}")
+    print(f"  long tradeable summary: {output_dir / 'tradeable_universe_long_summary.csv'}")
+    print(f"  short tradeable summary: {output_dir / 'tradeable_universe_short_summary.csv'}")
     print(f"  Riskfolio stock weights: {output_dir / 'riskfolio_stock_weights.parquet'}")
     print(f"  Riskfolio stock positions: {output_dir / 'riskfolio_stock_positions.parquet'}")
     print(f"  Riskfolio latest holdings: {output_dir / 'riskfolio_latest_holdings.csv'}")

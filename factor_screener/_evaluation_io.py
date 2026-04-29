@@ -71,11 +71,14 @@ def load_return_series(
     *,
     return_mode: str = "long_short",
     return_table_name: str = "factor_portfolio_returns",
+    preferred_period: str | int | pd.Timedelta | None = 1,
 ) -> pd.Series | None:
     try:
         frame = store.evaluation.returns(spec).get_table(return_table_name)
     except FileNotFoundError:
-        return None
+        frame = _load_legacy_return_frame(store, spec, return_mode=return_mode)
+        if frame is None:
+            return None
     if isinstance(frame, pd.Series):
         return normalize_time_series(frame, name=spec.table_name)
     if not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -87,14 +90,59 @@ def load_return_series(
     if "date_" in working.columns:
         numeric_columns = [column for column in working.columns if column != "date_" and pd.api.types.is_numeric_dtype(working[column])]
         if numeric_columns:
-            column = pick_return_column(working[numeric_columns], preferred_mode=return_mode)
+            column = pick_return_column(
+                working[numeric_columns],
+                preferred_mode=return_mode,
+                preferred_period=preferred_period,
+            )
             series = pd.Series(pd.to_numeric(working[column], errors="coerce").to_numpy(), index=working["date_"], name=spec.table_name)
             return normalize_time_series(series, name=spec.table_name)
-    column = pick_return_column(working, preferred_mode=return_mode)
+    column = _pick_top_quantile_column(working) if _is_long_only(return_mode) else None
+    if column is None:
+        column = pick_return_column(
+            working,
+            preferred_mode=return_mode,
+            preferred_period=preferred_period,
+        )
     series = working[column]
     if isinstance(series, pd.DataFrame):
         series = series.squeeze(axis=1)
     return normalize_time_series(series, name=spec.table_name)
+
+
+def _is_long_only(return_mode: str) -> bool:
+    return str(return_mode).strip().lower().replace("-", "_") == "long_only"
+
+
+def _pick_top_quantile_column(frame: pd.DataFrame) -> object | None:
+    if frame.empty:
+        return None
+    columns = pd.Index(frame.columns)
+    numeric = pd.Series(pd.to_numeric(columns.astype(str), errors="coerce"))
+    if numeric.notna().any():
+        return columns[int(numeric.idxmax())]
+    return None
+
+
+def _load_legacy_return_frame(
+    store: FactorStore,
+    spec: FactorSpec,
+    *,
+    return_mode: str,
+) -> pd.DataFrame | None:
+    table_names = (
+        ("primary_quantile_returns_by_date", "mean_return_by_quantile_by_date")
+        if _is_long_only(return_mode)
+        else ("mean_return_spread",)
+    )
+    for table_name in table_names:
+        try:
+            frame = store.evaluation.returns(spec).get_table(table_name)
+        except FileNotFoundError:
+            continue
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            return frame
+    return None
 
 
 def load_ic_series(

@@ -18,6 +18,7 @@ from tiger_factors.factor_screener import MarginalScreener
 from tiger_factors.factor_screener import MarginalScreenerSpec
 from tiger_factors.factor_screener import ScreeningEffectivenessSpec
 from tiger_factors.factor_screener import Screener
+from tiger_factors.factor_screener._evaluation_io import load_return_series
 
 
 def _save_factor_artifacts(
@@ -98,6 +99,30 @@ def _save_ic_artifacts(
         table_name="information_coefficient",
         force_updated=True,
     )
+
+
+def test_load_return_series_falls_back_to_legacy_spread_table(tmp_path: Path) -> None:
+    store = FactorStore(tmp_path)
+    spec = FactorSpec(
+        provider="tiger",
+        region="us",
+        sec_type="stock",
+        freq="1d",
+        table_name="alpha_legacy",
+        group="core",
+    )
+    store.evaluation_store.save_returns(
+        pd.DataFrame({"1D": [0.01, -0.02], "5D": [0.03, 0.04]}),
+        spec=spec,
+        table_name="mean_return_spread",
+        force_updated=True,
+    )
+
+    series = load_return_series(store, spec, return_mode="long_short")
+
+    assert series is not None
+    assert series.name == "alpha_legacy"
+    assert series.tolist() == [0.01, -0.02]
 
 
 def test_tiger_screener_reads_summary_and_return_panel(tmp_path: Path) -> None:

@@ -120,6 +120,35 @@ def test_evaluation_store_uses_factor_spec_directly(tmp_path: Path) -> None:
     store.save_evaluation(summary, metadata={"family": "price"}, spec=spec, force_updated=True)
 
 
+def test_evaluation_store_reads_unique_alternate_group(tmp_path: Path) -> None:
+    legacy_spec = FactorSpec(
+        region="US",
+        sec_type="stock",
+        freq="1d",
+        table_name="alpha_021",
+        provider="tiger",
+        group="apha101",
+    )
+    requested_spec = FactorSpec(
+        region="US",
+        sec_type="stock",
+        freq="1d",
+        table_name="alpha_021",
+        provider="tiger",
+        group="alpha_101",
+    )
+    summary = pd.DataFrame([{"ic_mean": 0.08, "sharpe": 1.2}])
+    returns = pd.DataFrame({"date_": pd.date_range("2024-01-01", periods=2), "long_short": [0.01, -0.02]})
+    store = EvaluationStore(tmp_path)
+
+    store.save_evaluation(summary, metadata={"family": "legacy"}, spec=legacy_spec)
+    store.save_returns(returns, spec=legacy_spec, table_name="factor_portfolio_returns")
+
+    assert store.section(requested_spec, "summary").get_table().equals(summary)
+    assert store.section(requested_spec, "returns").get_table("factor_portfolio_returns").equals(returns)
+    assert store.list_tables(requested_spec, "returns") == ["factor_portfolio_returns"]
+
+
 def test_evaluation_store_can_roundtrip_nested_summary_payload(tmp_path: Path) -> None:
     spec = FactorSpec(
         region="US",

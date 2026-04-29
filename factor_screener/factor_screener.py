@@ -7,6 +7,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from tiger_factors.factor_screener._evaluation_io import factor_frame_to_panel
+from tiger_factors.factor_screener._evaluation_io import load_return_series
 from tiger_factors.factor_screener._evaluation_io import normalize_time_series
 from tiger_factors.factor_screener._evaluation_io import pick_return_column
 from tiger_factors.factor_evaluation.utils import period_to_label
@@ -258,31 +259,7 @@ class FactorScreener:
         return normalized
 
     def _stored_long_short_series(self, factor_spec: FactorSpec) -> pd.Series | None:
-        section = self.store.evaluation.section(factor_spec, "returns")
-        try:
-            return_frame = section.get_table("factor_portfolio_returns")
-        except FileNotFoundError:
-            return None
-        if isinstance(return_frame, pd.Series):
-            return normalize_time_series(return_frame, name=factor_spec.table_name)
-        if not isinstance(return_frame, pd.DataFrame) or return_frame.empty:
-            return None
-        if "date_" in return_frame.columns:
-            date_index = pd.to_datetime(return_frame["date_"], errors="coerce")
-            numeric_columns = [
-                column
-                for column in return_frame.columns
-                if column != "date_" and pd.api.types.is_numeric_dtype(return_frame[column])
-            ]
-            if numeric_columns:
-                column = pick_return_column(return_frame[numeric_columns])
-                series = pd.Series(pd.to_numeric(return_frame[column], errors="coerce").to_numpy(), index=date_index, name=factor_spec.table_name)
-                return normalize_time_series(series, name=factor_spec.table_name)
-        column = pick_return_column(return_frame)
-        series = return_frame[column]
-        if isinstance(series, pd.DataFrame):
-            series = series.squeeze(axis=1)
-        return normalize_time_series(series, name=factor_spec.table_name)
+        return load_return_series(self.store, factor_spec, return_mode="long_short")
 
     def _stored_long_only_series(self, factor_spec: FactorSpec) -> pd.Series | None:
         section = self.store.evaluation.section(factor_spec, "returns")

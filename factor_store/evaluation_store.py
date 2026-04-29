@@ -119,32 +119,8 @@ class EvaluationSectionAccessor:
         return None if report_path is None else report_path.stem
 
     def get_table(self, table_name: str | None = None) -> pd.DataFrame:
-        section_dir = self.store._section_dir(self.spec, self.section)
-        if table_name is None:
-            default_file = section_dir / f"{self.section}.parquet"
-            if default_file.exists():
-                return pd.read_parquet(default_file)
-            parquet_files = sorted(section_dir.glob("*.parquet"))
-            if len(parquet_files) == 1:
-                return pd.read_parquet(parquet_files[0])
-            raise FileNotFoundError(
-                f"Unable to infer table for section '{self.section}'. "
-                f"Available parquet files: {[path.name for path in section_dir.glob('*.parquet')]!r}"
-            )
-
-        candidate = section_dir / f"{table_name}.parquet"
-        if candidate.exists():
-            return pd.read_parquet(candidate)
-        if "/" not in table_name and "\\" not in table_name:
-            matches = sorted(section_dir.rglob(f"{table_name}.parquet"))
-            if len(matches) == 1:
-                return pd.read_parquet(matches[0])
-            if len(matches) > 1:
-                raise FileNotFoundError(
-                    f"Ambiguous table '{table_name}' under section '{self.section}': "
-                    f"{[path.as_posix() for path in matches]!r}"
-                )
-        raise FileNotFoundError(section_dir / f"{table_name}.parquet")
+        table_path = self.store._resolve_table_path(self.spec, self.section, table_name)
+        return pd.read_parquet(table_path)
 
     def get_img(self, img_name: str):
         return self.store.get_img(self.spec, self.section, img_name)
@@ -182,8 +158,80 @@ class EvaluationStore:
     def _section_dir(self, spec: FactorSpec, section: str) -> Path:
         return _evaluation_dataset_dir(spec, self.root_dir) / section
 
+    def _alternate_section_dirs(self, spec: FactorSpec, section: str) -> list[Path]:
+        base_dir = self.root_dir / "evaluation" / spec.provider / spec.region / spec.sec_type / spec.freq
+        if not base_dir.exists():
+            return []
+        exact_dir = self._section_dir(spec, section)
+        candidates = [
+            path
+            for path in base_dir.glob(f"*/{spec.data_stem()}/{section}")
+            if path != exact_dir and path.is_dir()
+        ]
+        return sorted(candidates)
+
+    def _read_section_dirs(self, spec: FactorSpec, section: str) -> list[Path]:
+        exact_dir = self._section_dir(spec, section)
+        return [exact_dir, *self._alternate_section_dirs(spec, section)]
+
+    @staticmethod
+    def _table_matches(section_dir: Path, section: str, table_name: str | None) -> list[Path]:
+        if table_name is None:
+            default_file = section_dir / f"{section}.parquet"
+            if default_file.exists():
+                return [default_file]
+            return sorted(path for path in section_dir.glob("*.parquet") if path.is_file())
+
+        candidate = section_dir / f"{table_name}.parquet"
+        if candidate.exists():
+            return [candidate]
+        if "/" not in table_name and "\\" not in table_name:
+            return sorted(path for path in section_dir.rglob(f"{table_name}.parquet") if path.is_file())
+        return []
+
+    def _resolve_table_path(self, spec: FactorSpec, section: str, table_name: str | None) -> Path:
+        checked_files: list[str] = []
+        exact_dir = self._section_dir(spec, section)
+        exact_matches = self._table_matches(exact_dir, section, table_name)
+        checked_files.extend(path.name for path in exact_dir.glob("*.parquet"))
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+        if len(exact_matches) > 1:
+            label = section if table_name is None else table_name
+            raise FileNotFoundError(
+                f"Ambiguous table '{label}' under section '{section}': "
+                f"{[path.as_posix() for path in exact_matches]!r}"
+            )
+
+        fallback_matches: list[Path] = []
+        for section_dir in self._alternate_section_dirs(spec, section):
+            checked_files.extend(path.name for path in section_dir.glob("*.parquet"))
+            fallback_matches.extend(self._table_matches(section_dir, section, table_name))
+
+        if len(fallback_matches) == 1:
+            return fallback_matches[0]
+        if len(fallback_matches) > 1:
+            label = section if table_name is None else table_name
+            raise FileNotFoundError(
+                f"Ambiguous table '{label}' under section '{section}': "
+                f"{[path.as_posix() for path in fallback_matches]!r}"
+            )
+        if table_name is None:
+            raise FileNotFoundError(
+                f"Unable to infer table for section '{section}'. "
+                f"Available parquet files: {checked_files!r}"
+            )
+        raise FileNotFoundError(self._section_dir(spec, section) / f"{table_name}.parquet")
+
     def list_tables(self, spec: FactorSpec, section: str) -> list[str]:
-        section_dir = self._section_dir(spec, section)
+        section_dir = next(
+            (
+                candidate
+                for candidate in self._read_section_dirs(spec, section)
+                if any(path.is_file() for path in candidate.glob("*.parquet"))
+            ),
+            self._section_dir(spec, section),
+        )
         if not section_dir.exists():
             return []
         return sorted(
@@ -193,7 +241,14 @@ class EvaluationStore:
         )
 
     def list_imgs(self, spec: FactorSpec, section: str) -> list[str]:
-        section_dir = self._section_dir(spec, section)
+        section_dir = next(
+            (
+                candidate
+                for candidate in self._read_section_dirs(spec, section)
+                if any(path.is_file() for path in candidate.glob("*.png"))
+            ),
+            self._section_dir(spec, section),
+        )
         if not section_dir.exists():
             return []
         stems = [path.stem for path in section_dir.glob("*.png") if path.is_file()]
@@ -204,8 +259,11 @@ class EvaluationStore:
         return sorted(stems)
 
     def get_report_path(self, spec: FactorSpec, section: str) -> Path | None:
-        section_dir = self._section_dir(spec, section)
-        candidates = sorted(section_dir.glob("*.html"))
+        candidates: list[Path] = []
+        for section_dir in self._read_section_dirs(spec, section):
+            candidates = sorted(section_dir.glob("*.html"))
+            if candidates:
+                break
         if not candidates:
             return None
         if len(candidates) > 1:
@@ -220,7 +278,14 @@ class EvaluationStore:
     def get_img(self, spec: FactorSpec, section: str, img_name: str):
         from PIL import Image
 
-        img_path = self._section_dir(spec, section) / f"{img_name}.png"
+        img_path = next(
+            (
+                candidate / f"{img_name}.png"
+                for candidate in self._read_section_dirs(spec, section)
+                if (candidate / f"{img_name}.png").exists()
+            ),
+            self._section_dir(spec, section) / f"{img_name}.png",
+        )
         if not img_path.exists():
             raise FileNotFoundError(img_path)
         return Image.open(img_path)
